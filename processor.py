@@ -9,7 +9,7 @@ class TextureInspector:
         # Industry Standard: LBP with Radius 3 is optimal for textile weave
         self.RADIUS = 3
         self.N_POINTS = 8 * self.RADIUS
-        # 'uniform' method makes it Rotation Invariant (Fabric angle doesn't matter)
+        # 'uniform' method makes it Rotation Invariant
         self.METHOD = 'uniform'
         
     def _preprocess(self, img_buffer):
@@ -30,59 +30,44 @@ class TextureInspector:
         return img, img_small, img_gray, scale
 
     def compute_texture_map(self, img_gray):
-        """
-        Generates the LBP Texture Feature Map.
-        This converts 'Color' into 'Texture Codes'.
-        """
+        """Generates the LBP Texture Feature Map."""
         lbp = local_binary_pattern(img_gray, self.N_POINTS, self.RADIUS, self.METHOD)
-        # Normalize to 0-255 uint8 for visualization/processing
         lbp_norm = (lbp - lbp.min()) / (lbp.max() - lbp.min()) * 255
         return lbp_norm.astype(np.uint8)
 
     def compute_entropy_map(self, lbp_img):
-        """
-        Calculates Local Entropy (Randomness).
-        Defects interrupt the consistent randomness of the fabric weave.
-        """
-        # Disk(5) is a 10px sliding window - standard for macro-texture analysis
+        """Calculates Local Entropy (Randomness)."""
         ent_img = entropy(lbp_img, disk(5))
-        # Normalize
         ent_norm = cv2.normalize(ent_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return ent_norm
 
     def detect_defects(self, img_buffer, sensitivity=3.0, min_area=200):
-        """
-        Main Pipeline.
-        sensitivity: Z-Score threshold (Standard Deviations). 3.0 = 99.7% confidence.
-        """
+        """Main Pipeline: Returns Original, LBP, Entropy, Final Result, and Data Log."""
         # 1. Ingest
         orig_full, img_small, img_gray, scale_factor = self._preprocess(img_buffer)
         
-        # 2. Feature Extraction (Texture Physics)
+        # 2. Feature Extraction
         lbp_map = self.compute_texture_map(img_gray)
         entropy_map = self.compute_entropy_map(lbp_map)
         
-        # 3. Statistical Anomaly Detection (Robust Logic)
-        # Instead of fixed thresholds, we find the "Mean Texture" of this specific image
+        # 3. Statistical Anomaly Detection (Z-Score)
         mean_ent = np.mean(entropy_map)
         std_ent = np.std(entropy_map)
         
-        # We look for pixels that deviate significantly from the norm
-        # Strictness is controlled by 'sensitivity' (Sigma)
         lower_bound = mean_ent - (sensitivity * std_ent)
         upper_bound = mean_ent + (sensitivity * std_ent)
         
-        # Find Outliers (Too Smooth OR Too Rough)
-        mask_low = cv2.inRange(entropy_map, 0, lower_bound)       # Stains/Holes (Smoother)
-        mask_high = cv2.inRange(entropy_map, upper_bound, 255)    # Cuts/Snags (Rougher)
+        # Find Outliers
+        mask_low = cv2.inRange(entropy_map, 0, lower_bound)
+        mask_high = cv2.inRange(entropy_map, upper_bound, 255)
         mask_combined = cv2.bitwise_or(mask_low, mask_high)
         
-        # 4. Morphological Cleaning (Industrial Noise Filter)
+        # 4. Cleaning
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel, iterations=2)
         mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # 5. Connected Components & Classification
+        # 5. Classification
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
         
         defect_list = []
@@ -90,22 +75,18 @@ class TextureInspector:
         
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            
-            # Scale area back to original resolution for accurate filtering
             real_area = area / (scale_factor ** 2)
             
             if real_area < min_area: continue
             
-            # Extract ROI coords (Scaled)
+            # Extract ROI (Scaled)
             x = int(stats[i, cv2.CC_STAT_LEFT] / scale_factor)
             y = int(stats[i, cv2.CC_STAT_TOP] / scale_factor)
             w = int(stats[i, cv2.CC_STAT_WIDTH] / scale_factor)
             h = int(stats[i, cv2.CC_STAT_HEIGHT] / scale_factor)
             
-            # Classification Logic
+            # Logic
             aspect_ratio = float(w) / h
-            
-            # Get Intensity from original image for color-check
             roi = img_gray[stats[i, cv2.CC_STAT_TOP]:stats[i, cv2.CC_STAT_TOP]+stats[i, cv2.CC_STAT_HEIGHT], 
                            stats[i, cv2.CC_STAT_LEFT]:stats[i, cv2.CC_STAT_LEFT]+stats[i, cv2.CC_STAT_WIDTH]]
             roi_mean = np.mean(roi) if roi.size > 0 else 0
@@ -122,17 +103,16 @@ class TextureInspector:
                 color = (255, 0, 255) # Magenta
 
             defect_list.append({
-                "ID": i,
-                "Type": name,
-                "Area (px)": int(real_area),
-                "Confidence": f"{min(99, int(abs(mean_ent - 128)))}%" # Pseudo-confidence
+                "ID": i, "Type": name, "Area (px)": int(real_area),
+                "Confidence": f"{min(99, int(abs(mean_ent - 128)))}%"
             })
             
             # Drawing
             cv2.rectangle(final_output, (x, y), (x+w, y+h), color, 4)
-            label = f"{name} ({int(real_area)}px)"
+            label = f"{name}"
             cv2.putText(final_output, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             
         return orig_full, lbp_map, entropy_map, final_output, defect_list
 
+# Initialize Instance
 inspector = TextureInspector()
