@@ -23,7 +23,7 @@ with st.sidebar:
     # Tuning Parameters
     st.subheader("Detection Sensitivity")
     sensitivity = st.slider("Strictness Level", 1.0, 5.0, 2.5, 0.1)
-    min_area = st.slider("Min Defect Size (px)", 50, 500, 200)
+    min_area = st.slider("Min Defect Size (px)", 50, 1000, 500)
     
     st.info("Ready to scan.")
 
