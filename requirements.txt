@@ -1,5 +1,5 @@
 streamlit
-opencv-python
 numpy
-matplotlib
-pandas
+torch
+opencv-python-headless
+pillow
