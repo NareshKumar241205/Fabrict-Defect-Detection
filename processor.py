@@ -3,158 +3,194 @@ import numpy as np
 from skimage.feature import local_binary_pattern
 from skimage.filters.rank import entropy
 from skimage.morphology import disk
-from scipy.signal import find_peaks
-import config as cfg
 
-class QualityEngine:
+
+class TextureInspector:
     def __init__(self):
-        pass
+        # -------------------------------
+        # Texture parameters (UNCHANGED)
+        # -------------------------------
+        self.RADIUS = 3
+        self.N_POINTS = 8 * self.RADIUS
+        self.METHOD = "uniform"
 
+        # -------------------------------
+        # Structural decision tuning
+        # -------------------------------
+        self.STRUCTURE_EDGE_THRESHOLD = 0.55
+        self.STRUCTURE_DOMINANCE_RATIO = 0.06
+
+    # ======================================================
+    # PREPROCESS (UNCHANGED)
+    # ======================================================
     def _preprocess(self, img_buffer):
-        """Standardize image buffer to CV2 format."""
-        if hasattr(img_buffer, 'seek'): img_buffer.seek(0)
+        if hasattr(img_buffer, "seek"):
+            img_buffer.seek(0)
+
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
-        
-        # Resize logic
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
         h, w = img.shape[:2]
-        scale = cfg.IMAGE_RESIZE_WIDTH / w
-        new_h = int(h * scale)
-        img_small = cv2.resize(img, (cfg.IMAGE_RESIZE_WIDTH, new_h))
+        target_w = 800
+        scale = target_w / w
+
+        img_small = cv2.resize(img, (target_w, int(h * scale)))
         img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
-        
-        return img_small, img_gray, scale
+
+        return img, img_small, img_gray, scale
 
     # ======================================================
-    # ALGORITHM 1: Difference of Gaussians (For DENIM/TEXTURE)
+    # TEXTURE FEATURES (UNCHANGED)
     # ======================================================
-    def analyze_textured(self, img_gray, scale):
-        # 1. Bandpass Filter (DoG)
-        # Cancels out the weave pattern, leaves the defects
-        g1 = cv2.GaussianBlur(img_gray, (0, 0), cfg.TEXTURED_SETTINGS["SIGMA_FINE"])
-        g2 = cv2.GaussianBlur(img_gray, (0, 0), cfg.TEXTURED_SETTINGS["SIGMA_COARSE"])
-        dog = cv2.absdiff(g1, g2)
-        
-        # 2. Thresholding
-        _, mask = cv2.threshold(dog, cfg.TEXTURED_SETTINGS["THRESHOLD"], 255, cv2.THRESH_BINARY)
-        
-        # 3. Cleanup
+    def compute_texture_map(self, img_gray):
+        lbp = local_binary_pattern(
+            img_gray, self.N_POINTS, self.RADIUS, self.METHOD
+        )
+        lbp_norm = (lbp - lbp.min()) / (lbp.max() - lbp.min()) * 255
+        return lbp_norm.astype(np.uint8)
+
+    def compute_entropy_map(self, lbp_img):
+        ent_img = entropy(lbp_img, disk(5))
+        return cv2.normalize(
+            ent_img, None, 0, 255, cv2.NORM_MINMAX
+        ).astype(np.uint8)
+
+    # ======================================================
+    # 🆕 STRUCTURAL VETO (GLOBAL – DECISION ONLY)
+    # ======================================================
+    def _structural_veto(self, gray):
+        # Sobel edges
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+
+        mag_x = np.abs(gx)
+        mag_y = np.abs(gy)
+
+        # Projection profiles
+        proj_x = np.mean(mag_x, axis=0)
+        proj_y = np.mean(mag_y, axis=1)
+
+        proj_x /= (proj_x.max() + 1e-6)
+        proj_y /= (proj_y.max() + 1e-6)
+
+        vert_band = np.sum(proj_x > self.STRUCTURE_EDGE_THRESHOLD) / len(proj_x)
+        hori_band = np.sum(proj_y > self.STRUCTURE_EDGE_THRESHOLD) / len(proj_y)
+
+        if vert_band > self.STRUCTURE_DOMINANCE_RATIO:
+            return "Structural Seam / Missing Warp"
+
+        if hori_band > self.STRUCTURE_DOMINANCE_RATIO:
+            return "Structural Seam / Missing Weft"
+
+        return None
+
+    # ======================================================
+    # MAIN PIPELINE (ORIGINAL + FINAL DECISION HARDENING)
+    # ======================================================
+    def detect_defects(self, img_buffer, sensitivity=3.0, min_area=200):
+        orig_full, img_small, img_gray, scale = self._preprocess(img_buffer)
+
+        # -------------------------------
+        # TEXTURE ANALYSIS (UNCHANGED)
+        # -------------------------------
+        lbp_map = self.compute_texture_map(img_gray)
+        entropy_map = self.compute_entropy_map(lbp_map)
+
+        mean_ent = np.mean(entropy_map)
+        std_ent = np.std(entropy_map)
+
+        lower = mean_ent - sensitivity * std_ent
+        upper = mean_ent + sensitivity * std_ent
+
+        mask = cv2.bitwise_or(
+            cv2.inRange(entropy_map, 0, lower),
+            cv2.inRange(entropy_map, upper, 255)
+        )
+
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-        
-        return self._find_blobs(mask, scale, cfg.TEXTURED_SETTINGS["MIN_AREA"], "Structural Defect"), dog
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    # ======================================================
-    # ALGORITHM 2: LBP + Entropy (For SMOOTH FABRICS)
-    # ======================================================
-    def analyze_smooth(self, img_gray, scale):
-        # 1. Texture Map
-        radius = cfg.SMOOTH_SETTINGS["LBP_RADIUS"]
-        lbp = local_binary_pattern(img_gray, 8 * radius, radius, 'uniform')
-        lbp_uint8 = (lbp / np.max(lbp) * 255).astype(np.uint8)
-        
-        # 2. Entropy (Chaos) Map
-        ent = entropy(lbp_uint8, disk(5))
-        ent_norm = cv2.normalize(ent, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        # 3. Statistical Anomaly Detection
-        mean, std = np.mean(ent_norm), np.std(ent_norm)
-        thresh_val = mean - (cfg.SMOOTH_SETTINGS["SENSITIVITY"] * std)
-        
-        _, mask = cv2.threshold(ent_norm, thresh_val, 255, cv2.THRESH_BINARY_INV)
-        
-        # Cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-        
-        return self._find_blobs(mask, scale, cfg.SMOOTH_SETTINGS["MIN_AREA"], "Texture Defect"), ent_norm
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
 
-    # ======================================================
-    # ALGORITHM 3: Signal Analysis (For SEAMS)
-    # ======================================================
-    def analyze_seam(self, img_gray, scale):
-        h, w = img_gray.shape
         defects = []
-        
-        # 1. Find the Seam Line (Horizontal projection)
-        sobel_y = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
-        proj_y = np.sum(np.abs(sobel_y), axis=1)
-        seam_y = np.argmax(proj_y)
-        
-        # 2. Extract 1D Signal (Brightness profile along the seam)
-        margin = cfg.SEAM_SETTINGS["ROI_HEIGHT"] // 2
-        y1, y2 = max(0, seam_y - margin), min(h, seam_y + margin)
-        roi = img_gray[y1:y2, :]
-        
-        # Vertical summation of ROI creates a 1D signal of stitches
-        signal = np.sum(roi, axis=0)
-        # Invert so stitches are peaks
-        signal = np.max(signal) - signal 
-        
-        # 3. Peak Detection (Find individual stitches)
-        peaks, _ = find_peaks(signal, prominence=cfg.SEAM_SETTINGS["PEAK_HEIGHT"], distance=10)
-        
-        # 4. Rhythm Check
-        if len(peaks) > 5:
-            intervals = np.diff(peaks)
-            median_gap = np.median(intervals)
-            
-            for i, gap in enumerate(intervals):
-                # If a gap is too wide, it's a skip stitch
-                if gap > (median_gap * cfg.SEAM_SETTINGS["GAP_TOLERANCE"]):
-                    x1 = peaks[i]
-                    x2 = peaks[i+1]
-                    defects.append({
-                        "Type": "Skip Stitch",
-                        "Loc": (x1, seam_y, x2-x1, 40), # x, y, w, h
-                        "Area": int(gap)
-                    })
-        
-        return defects, None
+        output = orig_full.copy()
+        bg_mean = np.mean(img_gray)
 
-    # ======================================================
-    # UTILITIES
-    # ======================================================
-    def _find_blobs(self, mask, scale, min_area, label):
-        num, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        defects = []
-        for i in range(1, num):
+        # -------------------------------
+        # COMPONENT DEFECTS (UNCHANGED)
+        # -------------------------------
+        for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            if area < min_area: continue
-            
-            x = stats[i, cv2.CC_STAT_LEFT]
-            y = stats[i, cv2.CC_STAT_TOP]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            
+            real_area = area / (scale ** 2)
+
+            if real_area < min_area:
+                continue
+
+            x_s, y_s, w_s, h_s = stats[i, :4]
+            x = int(x_s / scale)
+            y = int(y_s / scale)
+            w = int(w_s / scale)
+            h = int(h_s / scale)
+
+            roi = img_gray[y_s:y_s + h_s, x_s:x_s + w_s]
+            roi_mean = np.mean(roi) if roi.size > 0 else bg_mean
+            aspect_ratio = max(w, h) / (min(w, h) + 1e-6)
+
+            if roi_mean < (bg_mean - 25) and aspect_ratio < 2.0:
+                label = "Stain / Oil"
+                color = (0, 140, 255)
+            elif aspect_ratio > 4.0:
+                label = "Cut / Tear"
+                color = (0, 0, 255)
+            else:
+                label = "Texture Defect"
+                color = (255, 0, 255)
+
             defects.append({
+                "ID": i,
                 "Type": label,
-                "Loc": (x, y, w, h),
-                "Area": int(area / scale**2)
+                "Area (px)": int(real_area)
             })
-        return defects
 
-    def run(self, img_file, mode):
-        img_small, img_gray, scale = self._preprocess(img_file)
-        result_img = img_small.copy()
-        debug_img = None
-        defects = []
+            cv2.rectangle(output, (x, y), (x + w, y + h), color, 3)
+            cv2.putText(
+                output, label,
+                (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2
+            )
 
-        # ROUTING LOGIC
-        if mode == "Smooth Fabric":
-            defects, debug_img = self.analyze_smooth(img_gray, scale)
-        elif mode == "Textured / Denim":
-            defects, debug_img = self.analyze_textured(img_gray, scale)
-        elif mode == "Seam Assembly":
-            defects, debug_img = self.analyze_seam(img_gray, scale)
+        # ======================================================
+        # 🔥 FINAL INDUSTRIAL DECISION HARDENING
+        # ======================================================
+        if len(defects) == 0:
+            structure_defect = self._structural_veto(img_gray)
+            if structure_defect is not None:
+                defects.append({
+                    "ID": 0,
+                    "Type": structure_defect,
+                    "Area (px)": 0
+                })
 
-        # VISUALIZATION
-        for d in defects:
-            x, y, w, h = d["Loc"]
-            cv2.rectangle(result_img, (x, y), (x+w, y+h), (0, 0, 255), 3)
-            cv2.putText(result_img, d["Type"], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(
+                    output,
+                    structure_defect,
+                    (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 255),
+                    3
+                )
 
-        return result_img, defects, debug_img
+        return orig_full, lbp_map, entropy_map, output, defects
 
-# Singleton
-engine = QualityEngine()
+
+# ======================================================
+# EXPORTED INSTANCE
+# ======================================================
+inspector = TextureInspector()
