@@ -1,138 +1,128 @@
+# inspectors.py
 import cv2
 import numpy as np
-from skimage.feature import local_binary_pattern
-from skimage.filters.rank import entropy
-from skimage.morphology import disk
+from skimage.feature import graycomatrix, graycoprops
+import config as cfg
 
-class TextureInspector:
-    def __init__(self):
-        # Industry Standard: LBP with Radius 3 is optimal for textile weave
-        self.RADIUS = 3
-        self.N_POINTS = 8 * self.RADIUS
-        # 'uniform' method makes it Rotation Invariant (Fabric angle doesn't matter)
-        self.METHOD = 'uniform'
-        
-    def _preprocess(self, img_buffer):
-        """Standardizes input resolution and color space."""
+class BaseInspector:
+    """Shared utilities for image processing."""
+    def preprocess(self, img_buffer):
+        """Converts input stream to optimized grayscale for analysis."""
         if hasattr(img_buffer, 'seek'): img_buffer.seek(0)
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, 1)
         
-        # Optimization: Resize large 4K images to 800px width for real-time speed
+        # Optimization: Resize strictly to 500px width
         h, w = img.shape[:2]
-        target_w = 800
-        scale = target_w / w
-        target_h = int(h * scale)
+        scale = cfg.IMAGE_RESIZE_WIDTH / w
+        new_h = int(h * scale)
         
-        img_small = cv2.resize(img, (target_w, target_h))
+        img_small = cv2.resize(img, (cfg.IMAGE_RESIZE_WIDTH, new_h))
         img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
         
-        return img, img_small, img_gray, scale
+        return img_small, img_gray
 
-    def compute_texture_map(self, img_gray):
-        """
-        Generates the LBP Texture Feature Map.
-        This converts 'Color' into 'Texture Codes'.
-        """
-        lbp = local_binary_pattern(img_gray, self.N_POINTS, self.RADIUS, self.METHOD)
-        # Normalize to 0-255 uint8 for visualization/processing
-        lbp_norm = (lbp - lbp.min()) / (lbp.max() - lbp.min()) * 255
-        return lbp_norm.astype(np.uint8)
+class SurfaceInspector(BaseInspector):
+    """Module A: Detects textural defects (Slubs, Holes, Missing Threads)."""
+    
+    def scan(self, img_gray, output_img):
+        h, w = img_gray.shape
+        defects = []
+        patch_size = cfg.GLCM["PATCH_SIZE"]
+        stride = cfg.GLCM["STRIDE"]
 
-    def compute_entropy_map(self, lbp_img):
-        """
-        Calculates Local Entropy (Randomness).
-        Defects interrupt the consistent randomness of the fabric weave.
-        """
-        # Disk(5) is a 10px sliding window - standard for macro-texture analysis
-        ent_img = entropy(lbp_img, disk(5))
-        # Normalize
-        ent_norm = cv2.normalize(ent_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        return ent_norm
+        # Sliding Window Logic
+        for y in range(0, h - patch_size, stride):
+            for x in range(0, w - patch_size, stride):
+                # 1. Extract Patch
+                patch = img_gray[y:y+patch_size, x:x+patch_size]
+                
+                # 2. Compute GLCM Matrix
+                glcm = graycomatrix(patch, cfg.GLCM["DISTANCES"], cfg.GLCM["ANGLES"], 
+                                    cfg.GLCM["LEVELS"], symmetric=True, normed=True)
+                
+                # 3. Extract Features
+                contrast = graycoprops(glcm, 'contrast').mean()
+                correlation = graycoprops(glcm, 'correlation').mean()
+                
+                # 4. Defect Classification
+                if contrast > cfg.GLCM["THRESH_CONTRAST"]:
+                    self._mark_defect(output_img, x, y, patch_size, cfg.COLORS["RED"])
+                    defects.append({"Type": "Slub / Hole", "Location": f"Grid ({x},{y})", "Severity": "Critical"})
+                
+                elif correlation < cfg.GLCM["THRESH_CORRELATION"]:
+                    self._mark_defect(output_img, x, y, patch_size, cfg.COLORS["ORANGE"])
+                    defects.append({"Type": "Missing Thread", "Location": f"Grid ({x},{y})", "Severity": "Major"})
 
-    def detect_defects(self, img_buffer, sensitivity=3.0, min_area=200):
-        """
-        Main Pipeline.
-        sensitivity: Z-Score threshold (Standard Deviations). 3.0 = 99.7% confidence.
-        """
-        # 1. Ingest
-        orig_full, img_small, img_gray, scale_factor = self._preprocess(img_buffer)
+        return output_img, defects
+
+    def _mark_defect(self, img, x, y, size, color):
+        cv2.rectangle(img, (x, y), (x+size, y+size), color, 2)
+
+class AssemblyInspector(BaseInspector):
+    """Module B: Detects geometric defects (Skip Stitch, Puckering)."""
+    
+    def scan(self, img_gray, output_img):
+        h, w = img_gray.shape
+        defects = []
         
-        # 2. Feature Extraction (Texture Physics)
-        lbp_map = self.compute_texture_map(img_gray)
-        entropy_map = self.compute_entropy_map(lbp_map)
+        # 1. Find Seam Line (Strongest Horizontal Edge)
+        sobel_y = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
+        seam_y = np.argmax(np.sum(np.abs(sobel_y), axis=1))
         
-        # 3. Statistical Anomaly Detection (Robust Logic)
-        # Instead of fixed thresholds, we find the "Mean Texture" of this specific image
-        mean_ent = np.mean(entropy_map)
-        std_ent = np.std(entropy_map)
+        # Visualize Seam
+        cv2.line(output_img, (0, seam_y), (w, seam_y), cfg.COLORS["CYAN"], 1)
         
-        # We look for pixels that deviate significantly from the norm
-        # Strictness is controlled by 'sensitivity' (Sigma)
-        lower_bound = mean_ent - (sensitivity * std_ent)
-        upper_bound = mean_ent + (sensitivity * std_ent)
+        # 2. Extract ROI
+        margin = cfg.SEAM["ROI_MARGIN"]
+        y1, y2 = max(0, seam_y - margin), min(h, seam_y + margin)
+        roi = img_gray[y1:y2, :]
         
-        # Find Outliers (Too Smooth OR Too Rough)
-        mask_low = cv2.inRange(entropy_map, 0, lower_bound)       # Stains/Holes (Smoother)
-        mask_high = cv2.inRange(entropy_map, upper_bound, 255)    # Cuts/Snags (Rougher)
-        mask_combined = cv2.bitwise_or(mask_low, mask_high)
+        # 3. Algorithm: Projection Profiling (Skip Stitch)
+        _, bin_roi = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        proj = np.sum(bin_roi, axis=0)
+        if proj.max() > 0: proj = proj / proj.max() # Normalize
         
-        # 4. Morphological Cleaning (Industrial Noise Filter)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel, iterations=1)
+        current_gap = 0
+        gap_limit = 10 # Approx pixel width of a normal stitch gap
         
-        # 5. Connected Components & Classification
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
-        
-        defect_list = []
-        final_output = orig_full.copy()
-        
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            
-            # Scale area back to original resolution for accurate filtering
-            real_area = area / (scale_factor ** 2)
-            
-            if real_area < min_area: continue
-            
-            # Extract ROI coords (Scaled)
-            x = int(stats[i, cv2.CC_STAT_LEFT] / scale_factor)
-            y = int(stats[i, cv2.CC_STAT_TOP] / scale_factor)
-            w = int(stats[i, cv2.CC_STAT_WIDTH] / scale_factor)
-            h = int(stats[i, cv2.CC_STAT_HEIGHT] / scale_factor)
-            
-            # Classification Logic
-            aspect_ratio = float(w) / h
-            
-            # Get Intensity from original image for color-check
-            roi = img_gray[stats[i, cv2.CC_STAT_TOP]:stats[i, cv2.CC_STAT_TOP]+stats[i, cv2.CC_STAT_HEIGHT], 
-                           stats[i, cv2.CC_STAT_LEFT]:stats[i, cv2.CC_STAT_LEFT]+stats[i, cv2.CC_STAT_WIDTH]]
-            roi_mean = np.mean(roi) if roi.size > 0 else 0
-            bg_mean = np.mean(img_gray)
-            
-            if roi_mean < (bg_mean - 40):
-                name = "Stain / Oil"
-                color = (0, 140, 255) # Orange
-            elif aspect_ratio > 3.0:
-                name = "Cut / Tear"
-                color = (0, 0, 255) # Red
+        for i in range(len(proj)):
+            if proj[i] < 0.2: # Gap detected
+                current_gap += 1
             else:
-                name = "Texture Defect"
-                color = (255, 0, 255) # Magenta
-
-            defect_list.append({
-                "ID": i,
-                "Type": name,
-                "Area (px)": int(real_area),
-                "Confidence": f"{min(99, int(abs(mean_ent - 128)))}%" # Pseudo-confidence
-            })
+                # If gap is 2.5x larger than normal -> Skip Stitch
+                if current_gap > (gap_limit * cfg.SEAM["GAP_TOLERANCE"]):
+                    center_x = i - current_gap//2
+                    self._mark_skip(output_img, center_x, seam_y)
+                    defects.append({"Type": "Skip Stitch", "Location": f"X:{center_x}", "Severity": "Critical"})
+                current_gap = 0
+                
+        # 4. Algorithm: Laplacian Variance (Puckering)
+        roughness = cv2.Laplacian(roi, cv2.CV_64F).var()
+        if roughness > cfg.SEAM["PUCKER_VAR"]:
+            cv2.putText(output_img, "PUCKER DETECTED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cfg.COLORS["ORANGE"], 2)
+            defects.append({"Type": "Seam Pucker", "Location": "Seam ROI", "Severity": "Moderate"})
             
-            # Drawing
-            cv2.rectangle(final_output, (x, y), (x+w, y+h), color, 4)
-            label = f"{name} ({int(real_area)}px)"
-            cv2.putText(final_output, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-        return orig_full, lbp_map, entropy_map, final_output, defect_list
+        return output_img, defects
 
-inspector = TextureInspector()
+    def _mark_skip(self, img, x, y):
+        cv2.circle(img, (x, y), 15, cfg.COLORS["RED"], 2)
+        cv2.putText(img, "SKIP", (x-10, y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, cfg.COLORS["RED"], 2)
+
+class QualityEngine:
+    """Facade: Single entry point for the Application."""
+    def __init__(self):
+        self.surface = SurfaceInspector()
+        self.assembly = AssemblyInspector()
+        
+    def run_inspection(self, img_file, mode):
+        # Route request to the correct engine
+        if mode == "Fabric Surface":
+            img, gray = self.surface.preprocess(img_file)
+            return self.surface.scan(gray, img)
+        else:
+            img, gray = self.assembly.preprocess(img_file)
+            return self.assembly.scan(gray, img)
+
+# Initialize Singleton
+engine = QualityEngine()
