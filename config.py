@@ -1,32 +1,30 @@
 # config.py
 import numpy as np
 
-# --- SYSTEM SETTINGS ---
-IMAGE_RESIZE_WIDTH = 600
-DEBUG_MODE = False
+# --- SYSTEM CONFIG ---
+IMAGE_RESIZE_WIDTH = 800  # High res for better defect detail
+DEBUG_MODE = True         # Returns debug images (masks) to UI
 
-# --- LOGIC A: SURFACE (DIFFERENCE OF GAUSSIANS) ---
-DOG = {
-    "KERNEL_1": (3, 3),      # Fine details (Weave)
-    "KERNEL_2": (21, 21),    # Coarse details (Structure)
-    "THRESHOLD": 40,         # Sensitivity (Lower = More sensitive)
-    "MIN_AREA": 150,         # Minimum defect size (px) to ignore noise
-    "MAX_AREA": 5000         # Maximum defect size
+# --- MODE A: SMOOTH FABRIC (LBP Logic) ---
+# Best for: Cotton, Silk, Polyester (Low noise)
+SMOOTH_SETTINGS = {
+    "LBP_RADIUS": 3,
+    "SENSITIVITY": 3.5,   # Sigma threshold (Higher = Less strict)
+    "MIN_AREA": 150       # Minimum defect size in pixels
 }
 
-# --- LOGIC B: SEAM (RHYTHMIC ANALYSIS) ---
-SEAM = {
-    "ROI_HEIGHT": 80,        # Height of the scan strip
-    "PEAK_PROMINENCE": 20,   # How much a stitch must "pop" out from background
-    "RHYTHM_TOLERANCE": 1.8, # If a gap is 1.8x the median gap -> ERROR
-    "EDGE_DENSITY_TH": 0.25  # Pucker threshold
+# --- MODE B: TEXTURED FABRIC (DoG Logic) ---
+# Best for: Denim, Twill, Knits (High noise)
+TEXTURED_SETTINGS = {
+    "SIGMA_FINE": 1.0,    # Blur amount to remove grain
+    "SIGMA_COARSE": 8.0,  # Blur amount to remove structure
+    "THRESHOLD": 25,      # Intensity difference to trigger alert
+    "MIN_AREA": 100
 }
 
-# --- UI COLORS (BGR) ---
-COLORS = {
-    "RED": (0, 0, 255),
-    "ORANGE": (0, 140, 255),
-    "CYAN": (255, 255, 0),
-    "GREEN": (0, 255, 0),
-    "MAGENTA": (255, 0, 255)
+# --- MODE C: SEAM INSPECTION (Geometry) ---
+SEAM_SETTINGS = {
+    "ROI_HEIGHT": 100,    # Height of strip to analyze around seam
+    "GAP_TOLERANCE": 1.8, # Anomaly threshold for stitch spacing
+    "PEAK_HEIGHT": 20     # Minimum brightness of a thread to be seen
 }
