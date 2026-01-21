@@ -1,0 +1,64 @@
+# ==============================
+# Python bytecode & cache
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==============================
+# Virtual environments
+# ==============================
+venv/
+.env/
+.env*/
+.venv/
+
+# ==============================
+# OS-specific files
+# ==============================
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Editor / IDE settings
+# ==============================
+.vscode/
+.idea/
+*.swp
+
+# ==============================
+# Streamlit
+# ==============================
+.streamlit/
+
+# ==============================
+# Logs & temporary files
+# ==============================
+*.log
+*.tmp
+
+# ==============================
+# Jupyter Notebook checkpoints
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# Build / distribution artifacts
+# ==============================
+build/
+dist/
+*.egg-info/
+
+# ==============================
+# Model / large generated files
+# (keep datasets only if required)
+# ==============================
+*.pyc
+*.pyo
+
+# ==============================
+# Image / video outputs (optional)
+# Uncomment if outputs should not be tracked
+# ==============================
+# outputs/
+# results/
