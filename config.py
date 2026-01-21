@@ -1,30 +1,26 @@
 # config.py
 import numpy as np
 
-# --- SYSTEM CONFIG ---
-IMAGE_RESIZE_WIDTH = 800  # High res for better defect detail
-DEBUG_MODE = True         # Returns debug images (masks) to UI
+# --- SYSTEM ---
+IMAGE_RESIZE_WIDTH = 800
+PATCH_SIZE = 48         # Slightly smaller to catch edges, but we will merge them later
+STEP_SIZE = 24          # 50% Overlap
+BACKGROUND_THRESH = 40  # Pixel intensity below this is considered "Background" and ignored
 
-# --- MODE A: SMOOTH FABRIC (LBP Logic) ---
-# Best for: Cotton, Silk, Polyester (Low noise)
-SMOOTH_SETTINGS = {
-    "LBP_RADIUS": 3,
-    "SENSITIVITY": 3.5,   # Sigma threshold (Higher = Less strict)
-    "MIN_AREA": 150       # Minimum defect size in pixels
+# --- MODULE A: GLCM (Fabric) ---
+GLCM_SETTINGS = {
+    "DISTANCES": [1],
+    "ANGLES": [0, np.pi/2],
+    "THRESHOLDS": {
+        "contrast_max": 250,      # Anything above this is definitely a hole/slub
+        "correlation_min": 0.80,  # Strict: Only flag if correlation drops significantly
+        "homogeneity_max": 0.98   # Very strict: Only flag if it's perfectly smooth (oil)
+    }
 }
 
-# --- MODE B: TEXTURED FABRIC (DoG Logic) ---
-# Best for: Denim, Twill, Knits (High noise)
-TEXTURED_SETTINGS = {
-    "SIGMA_FINE": 1.0,    # Blur amount to remove grain
-    "SIGMA_COARSE": 8.0,  # Blur amount to remove structure
-    "THRESHOLD": 25,      # Intensity difference to trigger alert
-    "MIN_AREA": 100
-}
-
-# --- MODE C: SEAM INSPECTION (Geometry) ---
+# --- MODULE B: SEAM (Stitch) ---
 SEAM_SETTINGS = {
-    "ROI_HEIGHT": 100,    # Height of strip to analyze around seam
-    "GAP_TOLERANCE": 1.8, # Anomaly threshold for stitch spacing
-    "PEAK_HEIGHT": 20     # Minimum brightness of a thread to be seen
+    "GAP_TOLERANCE": 10,       # Max pixels allowed between stitches
+    "MIN_STITCH_LENGTH": 5,    # Noise filter
+    "STITCH_COLOR_THRESH": 180 # Brightness of the thread (adjust if thread is dark)
 }
