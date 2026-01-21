@@ -1,0 +1,11 @@
+__pycache__/
+*.pt
+*.pth
+*.h5
+*.onnx
+data/
+models/
+*.jpg
+*.png
+*.jpeg
+Dataset/
