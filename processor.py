@@ -1,138 +1,188 @@
 import cv2
 import numpy as np
-from skimage.feature import local_binary_pattern
-from skimage.filters.rank import entropy
-from skimage.morphology import disk
+from skimage.feature import graycomatrix, graycoprops
+from config import DEFAULT_GLCM, DEFAULT_SEAM, DEFAULT_SYSTEM
 
-class TextureInspector:
+class FabricInspector:
     def __init__(self):
-        # Industry Standard: LBP with Radius 3 is optimal for textile weave
-        self.RADIUS = 3
-        self.N_POINTS = 8 * self.RADIUS
-        # 'uniform' method makes it Rotation Invariant (Fabric angle doesn't matter)
-        self.METHOD = 'uniform'
-        
-    def _preprocess(self, img_buffer):
-        """Standardizes input resolution and color space."""
-        if hasattr(img_buffer, 'seek'): img_buffer.seek(0)
+        self.patch_size = DEFAULT_SYSTEM["PATCH_SIZE"]
+        self.step = DEFAULT_SYSTEM["STEP_SIZE"]
+
+    def _preprocess(self, img_buffer, bg_thresh):
+        if hasattr(img_buffer, "seek"):
+            img_buffer.seek(0)
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         
-        # Optimization: Resize large 4K images to 800px width for real-time speed
         h, w = img.shape[:2]
-        target_w = 800
+        target_w = DEFAULT_SYSTEM["IMAGE_RESIZE_WIDTH"]
         scale = target_w / w
-        target_h = int(h * scale)
-        
-        img_small = cv2.resize(img, (target_w, target_h))
+        img_small = cv2.resize(img, (target_w, int(h * scale)))
         img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
         
-        return img, img_small, img_gray, scale
+        # Dynamic Background Masking
+        _, mask = cv2.threshold(img_gray, bg_thresh, 255, cv2.THRESH_BINARY)
+        
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        
+        return img_small, img_gray, mask
 
-    def compute_texture_map(self, img_gray):
-        """
-        Generates the LBP Texture Feature Map.
-        This converts 'Color' into 'Texture Codes'.
-        """
-        lbp = local_binary_pattern(img_gray, self.N_POINTS, self.RADIUS, self.METHOD)
-        # Normalize to 0-255 uint8 for visualization/processing
-        lbp_norm = (lbp - lbp.min()) / (lbp.max() - lbp.min()) * 255
-        return lbp_norm.astype(np.uint8)
-
-    def compute_entropy_map(self, lbp_img):
-        """
-        Calculates Local Entropy (Randomness).
-        Defects interrupt the consistent randomness of the fabric weave.
-        """
-        # Disk(5) is a 10px sliding window - standard for macro-texture analysis
-        ent_img = entropy(lbp_img, disk(5))
-        # Normalize
-        ent_norm = cv2.normalize(ent_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        return ent_norm
-
-    def detect_defects(self, img_buffer, sensitivity=3.0, min_area=200):
-        """
-        Main Pipeline.
-        sensitivity: Z-Score threshold (Standard Deviations). 3.0 = 99.7% confidence.
-        """
-        # 1. Ingest
-        orig_full, img_small, img_gray, scale_factor = self._preprocess(img_buffer)
-        
-        # 2. Feature Extraction (Texture Physics)
-        lbp_map = self.compute_texture_map(img_gray)
-        entropy_map = self.compute_entropy_map(lbp_map)
-        
-        # 3. Statistical Anomaly Detection (Robust Logic)
-        # Instead of fixed thresholds, we find the "Mean Texture" of this specific image
-        mean_ent = np.mean(entropy_map)
-        std_ent = np.std(entropy_map)
-        
-        # We look for pixels that deviate significantly from the norm
-        # Strictness is controlled by 'sensitivity' (Sigma)
-        lower_bound = mean_ent - (sensitivity * std_ent)
-        upper_bound = mean_ent + (sensitivity * std_ent)
-        
-        # Find Outliers (Too Smooth OR Too Rough)
-        mask_low = cv2.inRange(entropy_map, 0, lower_bound)       # Stains/Holes (Smoother)
-        mask_high = cv2.inRange(entropy_map, upper_bound, 255)    # Cuts/Snags (Rougher)
-        mask_combined = cv2.bitwise_or(mask_low, mask_high)
-        
-        # 4. Morphological Cleaning (Industrial Noise Filter)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # 5. Connected Components & Classification
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
-        
-        defect_list = []
-        final_output = orig_full.copy()
-        
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
+    def _merge_boxes(self, boxes):
+        """ Combines overlapping boxes. Validates singles are not deleted. """
+        if not boxes:
+            return []
             
-            # Scale area back to original resolution for accurate filtering
-            real_area = area / (scale_factor ** 2)
-            
-            if real_area < min_area: continue
-            
-            # Extract ROI coords (Scaled)
-            x = int(stats[i, cv2.CC_STAT_LEFT] / scale_factor)
-            y = int(stats[i, cv2.CC_STAT_TOP] / scale_factor)
-            w = int(stats[i, cv2.CC_STAT_WIDTH] / scale_factor)
-            h = int(stats[i, cv2.CC_STAT_HEIGHT] / scale_factor)
-            
-            # Classification Logic
-            aspect_ratio = float(w) / h
-            
-            # Get Intensity from original image for color-check
-            roi = img_gray[stats[i, cv2.CC_STAT_TOP]:stats[i, cv2.CC_STAT_TOP]+stats[i, cv2.CC_STAT_HEIGHT], 
-                           stats[i, cv2.CC_STAT_LEFT]:stats[i, cv2.CC_STAT_LEFT]+stats[i, cv2.CC_STAT_WIDTH]]
-            roi_mean = np.mean(roi) if roi.size > 0 else 0
-            bg_mean = np.mean(img_gray)
-            
-            if roi_mean < (bg_mean - 40):
-                name = "Stain / Oil"
-                color = (0, 140, 255) # Orange
-            elif aspect_ratio > 3.0:
-                name = "Cut / Tear"
-                color = (0, 0, 255) # Red
-            else:
-                name = "Texture Defect"
-                color = (255, 0, 255) # Magenta
-
-            defect_list.append({
-                "ID": i,
-                "Type": name,
-                "Area (px)": int(real_area),
-                "Confidence": f"{min(99, int(abs(mean_ent - 128)))}%" # Pseudo-confidence
+        rects = []
+        for b in boxes:
+            rects.append([b['x'], b['y'], b['w'], b['h']])
+        
+        # CRITICAL FIX: Add rectangles twice. 
+        # groupRectangles(thresh=1) requires 2 overlaps to keep a box.
+        # By doubling the list, single defects become "doubles" and are kept.
+        rects, weights = cv2.groupRectangles(rects + rects, groupThreshold=1, eps=0.2)
+        
+        merged_defects = []
+        for (x, y, w, h) in rects:
+            merged_defects.append({
+                "x": x, "y": y, "w": w, "h": h,
+                "type": "Defect", 
+                "score": 1.0
             })
-            
-            # Drawing
-            cv2.rectangle(final_output, (x, y), (x+w, y+h), color, 4)
-            label = f"{name} ({int(real_area)}px)"
-            cv2.putText(final_output, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-        return orig_full, lbp_map, entropy_map, final_output, defect_list
+        return merged_defects
 
-inspector = TextureInspector()
+    # =========================================
+    # MODULE A: GLCM (Texture & Structure)
+    # =========================================
+    def analyze_texture_glcm(self, img_gray, mask, settings):
+        h, w = img_gray.shape
+        raw_defects = []
+        
+        corr_thresh = settings.get("CORRELATION_MIN", DEFAULT_GLCM["CORRELATION_MIN"])
+        cont_thresh = settings.get("CONTRAST_MAX", DEFAULT_GLCM["CONTRAST_MAX"])
+        homo_thresh = settings.get("HOMOGENEITY_MAX", DEFAULT_GLCM["HOMOGENEITY_MAX"])
+        
+        for y in range(0, h - self.patch_size, self.step):
+            for x in range(0, w - self.patch_size, self.step):
+                
+                # Check Background
+                mask_patch = mask[y:y+self.patch_size, x:x+self.patch_size]
+                if cv2.countNonZero(mask_patch) < (self.patch_size * self.patch_size * 0.5):
+                    continue 
+
+                patch = img_gray[y:y+self.patch_size, x:x+self.patch_size]
+                
+                glcm = graycomatrix(patch, distances=DEFAULT_GLCM['DISTANCES'], 
+                                    angles=DEFAULT_GLCM['ANGLES'], levels=256, 
+                                    symmetric=True, normed=True)
+                
+                contrast = graycoprops(glcm, 'contrast').mean()
+                correlation = graycoprops(glcm, 'correlation').mean()
+                homogeneity = graycoprops(glcm, 'homogeneity').mean()
+                
+                if correlation < corr_thresh:
+                    raw_defects.append({"x": x, "y": y, "w": self.patch_size, "h": self.patch_size, "type": "Structure Break"})
+                elif contrast > cont_thresh:
+                    raw_defects.append({"x": x, "y": y, "w": self.patch_size, "h": self.patch_size, "type": "Slub / Hole"})
+                elif homogeneity > homo_thresh:
+                     raw_defects.append({"x": x, "y": y, "w": self.patch_size, "h": self.patch_size, "type": "Stain / Oil"})
+
+        return self._merge_boxes(raw_defects), img_gray # Return original gray for display
+
+    # =========================================
+    # MODULE B: SEAM INSPECTOR (Geometry)
+    # =========================================
+    def analyze_seam_geometry(self, img_gray, mask, settings):
+        stitch_thresh = settings.get("STITCH_COLOR_THRESH", DEFAULT_SEAM["STITCH_COLOR_THRESH"])
+        gap_tolerance = settings.get("GAP_TOLERANCE", DEFAULT_SEAM["GAP_TOLERANCE"])
+
+        # 1. Auto-Rotate (Deskew)
+        edges = cv2.Canny(img_gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=20)
+        
+        rot_img = img_gray.copy()
+        
+        # Calculate rotation angle
+        if lines is not None:
+            angles = []
+            for x1, y1, x2, y2 in lines[0]:
+                angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                if abs(angle) < 45 and abs(angle) > 0.5:
+                    angles.append(angle)
+            
+            if angles:
+                avg_angle = np.mean(angles)
+                center = (img_gray.shape[1]//2, img_gray.shape[0]//2)
+                M = cv2.getRotationMatrix2D(center, avg_angle, 1.0)
+                rot_img = cv2.warpAffine(img_gray, M, (img_gray.shape[1], img_gray.shape[0]))
+        
+        # 2. Extract Stitch Line
+        _, thread_mask = cv2.threshold(rot_img, stitch_thresh, 255, cv2.THRESH_BINARY)
+        
+        # 3. Projection Profile
+        proj = np.sum(thread_mask, axis=0) / 255 
+        
+        defects = []
+        gap_counter = 0
+        in_gap = False
+        gap_start = 0
+
+        for i, val in enumerate(proj):
+            if val < 2: # Gap
+                if not in_gap:
+                    in_gap = True
+                    gap_start = i
+                gap_counter += 1
+            else: # Thread
+                if in_gap:
+                    if gap_counter > gap_tolerance:
+                        # Ignore image edges
+                        if gap_start > 10 and i < (len(proj) - 10):
+                            defects.append({
+                                "x": gap_start, "y": 10, 
+                                "w": gap_counter, "h": rot_img.shape[0]-20,
+                                "type": "Skip Stitch",
+                                "score": gap_counter
+                            })
+                    in_gap = False
+                    gap_counter = 0
+
+        # CRITICAL FIX: Return the ROTATED image so boxes match the visual
+        return defects, rot_img
+
+    # =========================================
+    # MAIN PIPELINE
+    # =========================================
+    def process(self, img_buffer, mode="fabric", settings=None):
+        if settings is None: settings = {}
+        bg_thresh = settings.get("BACKGROUND_THRESH", DEFAULT_SYSTEM["BACKGROUND_THRESH"])
+        
+        small_color, small_gray, mask = self._preprocess(img_buffer, bg_thresh)
+        
+        found_defects = []
+        analyzed_image_gray = small_gray
+        
+        if mode == "fabric":
+            found_defects, analyzed_image_gray = self.analyze_texture_glcm(small_gray, mask, settings)
+        elif mode == "seam":
+            # This returns the ROTATED image
+            found_defects, analyzed_image_gray = self.analyze_seam_geometry(small_gray, mask, settings)
+            
+        # Convert gray back to BGR for drawing colored boxes
+        output_img = cv2.cvtColor(analyzed_image_gray, cv2.COLOR_GRAY2BGR)
+        
+        defect_log = []
+        for d in found_defects:
+            cv2.rectangle(output_img, (d['x'], d['y']), 
+                         (d['x'] + d['w'], d['y'] + d['h']), (0, 0, 255), 2)
+            cv2.putText(output_img, d['type'], (d['x'], d['y']-5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+            
+            defect_log.append({
+                "Type": d['type'],
+                "Area (px)": d['w'] * d['h']
+            })
+
+        return output_img, defect_log
+
+inspector = FabricInspector()
