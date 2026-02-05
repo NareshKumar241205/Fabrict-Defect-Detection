@@ -23,7 +23,7 @@ with st.sidebar:
     st.divider()
     
     # Advanced settings hidden by default for "One Click" experience
-    with st.expander("⚙️ Advanced Calibration"):
+    with st.expander("Advanced Calibration"):
         st.caption("Engine Sensitivity")
         spectral_sensitivity = st.slider("Structural (Slubs/Tears)", 1.0, 5.0, 3.0, 0.1)
         lbp_sensitivity = st.slider("Texture (Stains)", 1.0, 5.0, 3.0, 0.1)
@@ -139,9 +139,9 @@ if img_file is not None:
     col_status1, col_status2 = st.columns([3, 1])
     with col_status1:
         if defect_count == 0:
-            st.success("✅ **PASS**: Material Certified OK")
+            st.success("PASS: Material Certified OK")
         else:
-            st.error(f"❌ **FAIL**: {defect_count} Defects Detected")
+            st.error(f"FAIL: {defect_count} Defects Detected")
             
     with col_status2:
         st.metric("Cycle Time", f"{processing_time:.0f} ms")
@@ -152,13 +152,13 @@ if img_file is not None:
     with col1:
         st.subheader(" defect Map")
         # Primary View: Spectral (Surface) because it's most common
-        st.image(base_draw_img, caption="Surface Analysis (Spectral + AI)", use_container_width=True)
+        st.image(base_draw_img, caption="Surface Analysis (Spectral + AI)", width="stretch")
         
         # Secondary View: Only if Seam defects found
         if any(d["Source"] == "Seam" for d in all_defects):
              img_file.seek(0)
              _, seam_img, _ = stitch_inspector.check_seam_quality(img_file, laplacian_threshold=laplacian_thresh)
-             st.image(seam_img, caption="Seam Analysis", use_container_width=True)
+             st.image(seam_img, caption="Seam Analysis", width="stretch")
 
     with col2:
         st.subheader("Defect Manifest")
@@ -166,7 +166,7 @@ if img_file is not None:
             df = pd.DataFrame(all_defects)
             # Clean Table
             display_df = df[["Source", "Type", "Location"] if "Location" in df.columns else ["Source", "Type"]]
-            st.dataframe(display_df, hide_index=True, use_container_width=True)
+            st.dataframe(display_df, hide_index=True, width="stretch")
         else:
             st.info("No anomalies detected.")
 
@@ -175,7 +175,7 @@ if img_file is not None:
         with st.expander("Technician View"):
             cols = st.columns(len(debug_images))
             for i, (k, v) in enumerate(debug_images.items()):
-                cols[i].image(v, caption=k, use_container_width=True)
+                cols[i].image(v, caption=k, width="stretch")
 
 else:
-    st.info("👆 Feed the machine to start proper auto-inspection.")
+    st.info("Feed the machine to start proper auto-inspection.")
