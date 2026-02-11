@@ -17,6 +17,8 @@ class TextureInspector:
         if hasattr(img_buffer, 'seek'): img_buffer.seek(0)
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, 1)
+        if img is None:
+            raise ValueError("Could not decode image file")
         
         # Optimization: Resize large 4K images to 800px width for real-time speed
         h, w = img.shape[:2]

@@ -6,7 +6,7 @@ Analyzes seam/stitch quality using two complementary algorithms:
 2. Laplacian Variance - Detects puckers (wrinkled fabric near seam)
 
 Usage:
-    from stitch_inspector import stitch_inspector
+    from inspectors import stitch_inspector
     result = stitch_inspector.check_seam_quality(image_buffer)
 """
 
@@ -39,6 +39,8 @@ class StitchInspector:
         
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode image file")
         
         # Resize for performance (target 720p width)
         h, w = img.shape[:2]

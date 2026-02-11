@@ -37,6 +37,8 @@ class EdgeLineDetector:
         
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode image file")
         
         # Resize for performance
         h, w = img.shape[:2]

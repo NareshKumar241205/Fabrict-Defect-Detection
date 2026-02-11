@@ -46,6 +46,8 @@ class GLCMInspector:
         
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode image file")
         
         # Resize for performance (target 720p width)
         h, w = img.shape[:2]
@@ -112,7 +114,7 @@ class GLCMInspector:
         img_buffer: BinaryIO,
         contrast_threshold: float = None,
         correlation_threshold: float = None
-    ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """
         Main detection pipeline using sliding window GLCM analysis.
         
@@ -122,7 +124,7 @@ class GLCMInspector:
             correlation_threshold: Override default correlation threshold
             
         Returns:
-            Tuple of (original_image, annotated_result, defect_list)
+            Tuple of (original_image, annotated_result, contrast_heatmap, defect_list)
         """
         # Allow threshold overrides
         if contrast_threshold is not None:
