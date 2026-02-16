@@ -152,6 +152,13 @@ class SpectralInspector:
 
             x, y, w, h = cv2.boundingRect(contour)
             defect_id += 1
+
+            # Scale coordinates back to original image
+            ox = int(x / scale)
+            oy = int(y / scale)
+            ow = int(w / scale)
+            oh = int(h / scale)
+            real_area = int(area / (scale ** 2))
             
             # Classify roughly by shape
             aspect_ratio = w / float(h)
@@ -170,19 +177,19 @@ class SpectralInspector:
             mean_sal = np.mean(saliency_map[y:y+h, x:x+w])
             confidence = min(99, int((mean_sal / max(thresh_val, 1)) * 50))
 
-            # Draw
-            cv2.rectangle(result, (x, y), (x+w, y+h), color, 3)
-            cv2.putText(result, f"{d_type} ({int(area)})", (x, y-10), 
+            # Draw on original-scale result image
+            cv2.rectangle(result, (ox, oy), (ox+ow, oy+oh), color, 3)
+            cv2.putText(result, f"{d_type} ({real_area})", (ox, oy-10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
             self.defects.append({
                 "ID": defect_id,
                 "Type": d_type,
-                "Area (px)": int(area),
+                "Area (px)": real_area,
                 "Confidence": f"{confidence}%",
-                "Location": f"({x}, {y})",
+                "Location": f"({ox}, {oy})",
                 "Saliency": f"{int(mean_sal)}",
-                "bbox_x": x, "bbox_y": y, "bbox_w": w, "bbox_h": h
+                "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh
             })
         
         # Colorize saliency for visualization

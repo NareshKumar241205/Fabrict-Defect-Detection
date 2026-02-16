@@ -15,7 +15,6 @@ from io import BytesIO
 from datetime import datetime
 
 from inspectors import texture_inspector, spectral_inspector, seam_inspector, edge_inspector
-from config import SEAM_SETTINGS
 
 # ──────────────────────────────────────────────
 # DEFECT CLASSIFICATION MAP
@@ -315,6 +314,53 @@ def validate_image(img_file):
     return img, None
 
 
+def deduplicate_defects(defects, iou_threshold=0.5):
+    """Remove overlapping defects using Non-Maximum Suppression.
+    
+    When two defect boxes overlap >= iou_threshold, the one with
+    lower confidence is dropped.
+    """
+    if len(defects) <= 1:
+        return defects
+
+    def _conf(d):
+        c = d.get("Confidence", "0%")
+        try: return int(str(c).replace("%", "").strip())
+        except: return 0
+
+    def _iou(a, b):
+        ax1, ay1 = a.get("bbox_x", 0), a.get("bbox_y", 0)
+        ax2 = ax1 + a.get("bbox_w", 0)
+        ay2 = ay1 + a.get("bbox_h", 0)
+        bx1, by1 = b.get("bbox_x", 0), b.get("bbox_y", 0)
+        bx2 = bx1 + b.get("bbox_w", 0)
+        by2 = by1 + b.get("bbox_h", 0)
+
+        ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        union = area_a + area_b - inter
+        return inter / max(union, 1)
+
+    # Sort by confidence descending
+    sorted_defs = sorted(defects, key=_conf, reverse=True)
+    keep = []
+
+    for d in sorted_defs:
+        suppressed = False
+        for kept in keep:
+            if _iou(d, kept) >= iou_threshold:
+                suppressed = True
+                break
+        if not suppressed:
+            keep.append(d)
+
+    return keep
+
+
 def decode_image(img_file):
     """Read an image file into a BGR numpy array."""
     img_file.seek(0)
@@ -468,6 +514,9 @@ with tab_inspect:
                     except: return 0
 
                 all_defects = [d for d in all_defects if _conf_val(d) >= conf_threshold]
+
+                # Deduplicate overlapping boxes across inspectors
+                all_defects = deduplicate_defects(all_defects, iou_threshold=0.5)
 
                 structural = [d for d in all_defects if d["Category"] == "Structural"]
                 surface = [d for d in all_defects if d["Category"] == "Surface"]
