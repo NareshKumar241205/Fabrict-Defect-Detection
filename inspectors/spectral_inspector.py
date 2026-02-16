@@ -102,8 +102,21 @@ class SpectralInspector:
         original, img_gray, scale = self._preprocess(img_buffer)
         result = original.copy()
         
-        # 1. Compute Saliency
-        saliency_map = self._compute_saliency_map(img_gray)
+        # 1. Multi-Resolution Saliency (Image Pyramid)
+        # Compute saliency at multiple scales to catch both macro and micro defects
+        fft_scales = [512, 256, 128]
+        saliency_maps = []
+        
+        for fft_size in fft_scales:
+            # Temporarily override resize width for this scale
+            old_resize = self.RESIZE_WIDTH
+            self.RESIZE_WIDTH = fft_size
+            sal = self._compute_saliency_map(img_gray)
+            self.RESIZE_WIDTH = old_resize
+            saliency_maps.append(sal)
+        
+        # Fuse: take max saliency across all scales
+        saliency_map = np.maximum.reduce(saliency_maps)
         
         # 2. Dynamic Thresholding (Auto-Calibration)
         #    We assume the saliency map is mostly dark (0).
@@ -128,40 +141,49 @@ class SpectralInspector:
         self.defects = []
         defect_id = 0
         
+        img_total_area = img_gray.shape[0] * img_gray.shape[1]
+        min_area = max(200, int(img_total_area * 0.002))  # 0.2% of image or 200px
+
         for contour in contours:
             area = cv2.contourArea(contour)
             
-            # Filter noise (relative to image size)
-            if area > (img_gray.shape[0] * img_gray.shape[1] * 0.0005): # ~0.05% of image
-                x, y, w, h = cv2.boundingRect(contour)
-                
-                defect_id += 1
-                
-                # Classify roughly by shape
-                aspect_ratio = w / float(h)
-                
-                # Logic: If it's very long, it's a structural line
-                if aspect_ratio > 3.0: 
-                    d_type = "Horizontal Tear/Thread"
-                    color = (0, 0, 255) # Red
-                elif aspect_ratio < 0.33:
-                    d_type = "Vertical Tear/Thread"
-                    color = (0, 0, 255) # Red
-                else:
-                    d_type = "Texture Anomaly"
-                    color = (0, 165, 255) # Orange
-                
-                # Draw
-                cv2.rectangle(result, (x, y), (x+w, y+h), color, 3)
-                cv2.putText(result, f"{d_type} ({int(area)})", (x, y-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                
-                self.defects.append({
-                    "ID": defect_id,
-                    "Type": d_type,
-                    "Location": f"({x}, {y})",
-                    "Saliency": f"{int(np.mean(saliency_map[y:y+h, x:x+w]))}"
-                })
+            if area < min_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            defect_id += 1
+            
+            # Classify roughly by shape
+            aspect_ratio = w / float(h)
+            
+            if aspect_ratio > 3.0: 
+                d_type = "Horizontal Tear/Thread"
+                color = (0, 0, 255)
+            elif aspect_ratio < 0.33:
+                d_type = "Vertical Tear/Thread"
+                color = (0, 0, 255)
+            else:
+                d_type = "Texture Anomaly"
+                color = (0, 165, 255)
+            
+            # Confidence: saliency intensity relative to threshold
+            mean_sal = np.mean(saliency_map[y:y+h, x:x+w])
+            confidence = min(99, int((mean_sal / max(thresh_val, 1)) * 50))
+
+            # Draw
+            cv2.rectangle(result, (x, y), (x+w, y+h), color, 3)
+            cv2.putText(result, f"{d_type} ({int(area)})", (x, y-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            self.defects.append({
+                "ID": defect_id,
+                "Type": d_type,
+                "Area (px)": int(area),
+                "Confidence": f"{confidence}%",
+                "Location": f"({x}, {y})",
+                "Saliency": f"{int(mean_sal)}",
+                "bbox_x": x, "bbox_y": y, "bbox_w": w, "bbox_h": h
+            })
         
         # Colorize saliency for visualization
         saliency_heatmap = cv2.applyColorMap(saliency_map, cv2.COLORMAP_INFERNO)

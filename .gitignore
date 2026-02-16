@@ -51,10 +51,11 @@ dist/
 
 # ==============================
 # Model / large generated files
-# (keep datasets only if required)
 # ==============================
 *.pyc
 *.pyo
+Dataset/
+inspection_history.json
 
 # ==============================
 # Image / video outputs (optional)

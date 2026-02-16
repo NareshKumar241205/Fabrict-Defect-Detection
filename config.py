@@ -2,10 +2,12 @@
 import numpy as np
 
 # --- SYSTEM ---
-IMAGE_RESIZE_WIDTH = 800
-PATCH_SIZE = 48         # Slightly smaller to catch edges, but we will merge them later
-STEP_SIZE = 24          # 50% Overlap
-BACKGROUND_THRESH = 40  # Pixel intensity below this is considered "Background" and ignored
+DEFAULT_SYSTEM = {
+    "IMAGE_RESIZE_WIDTH": 800,
+    "PATCH_SIZE": 48,         # Slightly smaller to catch edges
+    "STEP_SIZE": 24,          # 50% Overlap
+    "BACKGROUND_THRESH": 40   # Pixel intensity below this is "Background"
+}
 
 # --- MODULE A: GLCM (Fabric) ---
 GLCM_SETTINGS = {
