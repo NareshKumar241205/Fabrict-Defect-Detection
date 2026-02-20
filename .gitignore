@@ -56,6 +56,7 @@ dist/
 *.pyo
 Dataset/
 inspection_history.json
+feedback_log.json
 
 # ==============================
 # Image / video outputs (optional)

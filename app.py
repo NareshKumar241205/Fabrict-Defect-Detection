@@ -11,8 +11,11 @@ import numpy as np
 import pandas as pd
 import json
 import os
+import base64
+import tempfile
 from io import BytesIO
 from datetime import datetime
+from fpdf import FPDF
 
 from inspectors import texture_inspector, spectral_inspector, seam_inspector, edge_inspector
 
@@ -369,6 +372,205 @@ def decode_image(img_file):
     return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
 
+# ── PDF REPORT ──
+def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defects, verdict, s_count, f_count):
+    """Generate a PDF report with images, defect table, and verdict."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Helper: save BGR image to temp JPEG, return path
+    def _save_temp(bgr_img):
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        cv2.imwrite(tmp.name, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        return tmp.name
+
+    tmp_files = []
+
+    try:
+        # Page 1: Header + Verdict + Images
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.cell(0, 12, "FabricQA - Inspection Report", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+
+        # Verdict
+        pdf.set_font("Helvetica", "B", 16)
+        color = (220, 53, 69) if verdict == "FAIL" else (40, 167, 69)
+        pdf.set_text_color(*color)
+        pdf.cell(0, 10, f"Verdict: {verdict}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 7, f"Total Defects: {s_count + f_count}  |  Structural: {s_count}  |  Surface: {f_count}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+
+        # Images
+        img_w = 58
+        for label, img in [("Original", base_img), ("Structural", structural_overlay), ("Surface", surface_overlay)]:
+            tmp = _save_temp(img)
+            tmp_files.append(tmp)
+
+        pdf.set_font("Helvetica", "B", 10)
+        x_start = 10
+        for i, label in enumerate(["Original", "Structural Defects", "Surface Defects"]):
+            x = x_start + i * 63
+            pdf.set_xy(x, pdf.get_y())
+            pdf.cell(img_w, 5, label)
+
+        y_img = pdf.get_y() + 6
+        for i, tmp in enumerate(tmp_files):
+            pdf.image(tmp, x=x_start + i * 63, y=y_img, w=img_w)
+
+        # Page 2: Defect Table
+        if all_defects:
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.cell(0, 10, "Defect Details", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(3)
+
+            # Table header
+            headers = ["#", "Category", "Type", "Area (px)", "Confidence"]
+            col_w = [10, 30, 50, 25, 25]
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(240, 240, 240)
+            for j, h in enumerate(headers):
+                pdf.cell(col_w[j], 7, h, border=1, fill=True)
+            pdf.ln()
+
+            # Table rows
+            pdf.set_font("Helvetica", "", 8)
+            for idx, d in enumerate(all_defects[:50], 1):  # cap at 50 rows
+                pdf.cell(col_w[0], 6, str(idx), border=1)
+                pdf.cell(col_w[1], 6, d.get("Category", ""), border=1)
+                pdf.cell(col_w[2], 6, d.get("Type", "")[:30], border=1)
+                pdf.cell(col_w[3], 6, str(d.get("Area (px)", "")), border=1)
+                pdf.cell(col_w[4], 6, str(d.get("Confidence", "")), border=1)
+                pdf.ln()
+
+        return pdf.output()
+
+    finally:
+        for f in tmp_files:
+            try: os.unlink(f)
+            except: pass
+
+
+# ── BEFORE/AFTER COMPARISON SLIDER ──
+def render_comparison_slider(original_bgr, annotated_bgr):
+    """Render an interactive before/after slider using HTML/CSS/JS."""
+    def _to_b64(bgr):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        _, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf).decode()
+
+    b64_before = _to_b64(original_bgr)
+    b64_after = _to_b64(annotated_bgr)
+
+    uid = f"slider_{id(original_bgr)}"
+
+    html = f"""
+    <div id="{uid}" style="position:relative;width:100%;max-width:700px;margin:0 auto;overflow:hidden;
+         border-radius:12px;border:1px solid rgba(255,255,255,0.1);user-select:none;-webkit-user-select:none;">
+      <img src="data:image/jpeg;base64,{b64_after}" style="width:100%;display:block;" />
+      <div id="{uid}_clip" style="position:absolute;top:0;left:0;width:50%;height:100%;overflow:hidden;">
+        <img src="data:image/jpeg;base64,{b64_before}" style="width:100%;height:100%;object-fit:cover;
+             min-width:200%;max-width:none;" id="{uid}_bimg" />
+      </div>
+      <div id="{uid}_handle" style="position:absolute;top:0;left:50%;width:3px;height:100%;
+           background:rgba(255,255,255,0.9);cursor:ew-resize;z-index:10;transform:translateX(-50%);">
+        <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+             background:rgba(255,255,255,0.95);border-radius:50%;width:32px;height:32px;
+             display:flex;align-items:center;justify-content:center;font-size:14px;
+             box-shadow:0 2px 8px rgba(0,0,0,0.3);">⇔</div>
+      </div>
+      <div style="position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.6);color:#fff;
+           padding:2px 8px;border-radius:4px;font-size:11px;">Original</div>
+      <div style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,0.6);color:#fff;
+           padding:2px 8px;border-radius:4px;font-size:11px;">Annotated</div>
+    </div>
+    <script>
+    (function(){{
+      var container = document.getElementById("{uid}");
+      var clip = document.getElementById("{uid}_clip");
+      var handle = document.getElementById("{uid}_handle");
+      var bimg = document.getElementById("{uid}_bimg");
+      var dragging = false;
+      function update(x) {{
+        var rect = container.getBoundingClientRect();
+        var pct = Math.max(0, Math.min(1, (x - rect.left) / rect.width));
+        clip.style.width = (pct * 100) + "%";
+        handle.style.left = (pct * 100) + "%";
+        bimg.style.minWidth = (100 / Math.max(pct, 0.01)) + "%";
+      }}
+      container.addEventListener("mousedown", function(e) {{ dragging = true; update(e.clientX); }});
+      window.addEventListener("mousemove", function(e) {{ if (dragging) update(e.clientX); }});
+      window.addEventListener("mouseup", function() {{ dragging = false; }});
+      container.addEventListener("touchstart", function(e) {{ dragging = true; update(e.touches[0].clientX); }});
+      container.addEventListener("touchmove", function(e) {{ if (dragging) {{ update(e.touches[0].clientX); e.preventDefault(); }} }});
+      container.addEventListener("touchend", function() {{ dragging = false; }});
+    }})();
+    </script>
+    """
+    st.components.v1.html(html, height=500)
+
+
+# ── DEFECT HEATMAP (BATCH) ──
+def generate_defect_heatmap(all_defects, canvas_size=600):
+    """Generate an aggregate heatmap showing where defects cluster."""
+    heatmap = np.zeros((canvas_size, canvas_size), dtype=np.float32)
+
+    if not all_defects:
+        return None
+
+    for d in all_defects:
+        bx = d.get("bbox_x", 0)
+        by = d.get("bbox_y", 0)
+        bw = d.get("bbox_w", 0)
+        bh = d.get("bbox_h", 0)
+        if bw <= 0 or bh <= 0:
+            continue
+        # Normalize to canvas coordinates (assume max 2000px original)
+        scale = canvas_size / 2000.0
+        x1 = max(0, min(canvas_size - 1, int(bx * scale)))
+        y1 = max(0, min(canvas_size - 1, int(by * scale)))
+        x2 = max(0, min(canvas_size, int((bx + bw) * scale)))
+        y2 = max(0, min(canvas_size, int((by + bh) * scale)))
+        if x2 > x1 and y2 > y1:
+            heatmap[y1:y2, x1:x2] += 1.0
+
+    if np.max(heatmap) == 0:
+        return None
+
+    # Blur and normalize
+    heatmap = cv2.GaussianBlur(heatmap, (51, 51), 0)
+    heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    return colored
+
+
+# ── FEEDBACK LOOP ──
+FEEDBACK_FILE = "feedback_log.json"
+
+def load_feedback():
+    """Load user feedback from JSON file."""
+    if os.path.exists(FEEDBACK_FILE):
+        try:
+            with open(FEEDBACK_FILE, "r") as f:
+                return json.load(f)
+        except: pass
+    return []
+
+def save_feedback(entry):
+    """Append a feedback entry to JSON file."""
+    data = load_feedback()
+    data.append(entry)
+    with open(FEEDBACK_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
 def draw_category_overlay(base_img, defects, color_bgr, label_prefix):
     """Draw bounding boxes for a list of defects onto a copy of the image."""
     overlay = base_img.copy()
@@ -559,6 +761,16 @@ with tab_inspect:
                         st.caption(f"🟡  Surface Defects ({f_count})")
                         st.image(surface_overlay, channels="BGR", use_container_width=True)
 
+                # ── BEFORE / AFTER COMPARISON ──
+                if total > 0:
+                    st.markdown('<div class="sec-title">Before / After Comparison</div>', unsafe_allow_html=True)
+                    # Merge both overlays into one annotated image
+                    annotated = draw_category_overlay(base_img, structural, (113, 113, 248), "S")
+                    annotated = draw_category_overlay(annotated, surface, (36, 191, 251), "F")
+                    with st.container(border=True):
+                        st.caption("Drag the slider to compare original vs annotated")
+                        render_comparison_slider(base_img, annotated)
+
                 # ── DIAGNOSTIC MAPS ──
                 st.markdown('<div class="sec-title">Diagnostic Maps</div>', unsafe_allow_html=True)
                 mc1, mc2 = st.columns(2)
@@ -600,6 +812,33 @@ with tab_inspect:
                     cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred and not c.startswith("bbox")]
                     csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
                     st.download_button("⬇  Download Full Report (CSV)", csv, "fabricqa_report.csv", mime="text/csv")
+
+                    # PDF Report
+                    try:
+                        pdf_bytes = generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defects, verdict, s_count, f_count)
+                        st.download_button("📄  Download PDF Report", pdf_bytes, "fabricqa_report.pdf", mime="application/pdf")
+                    except Exception:
+                        pass  # silently skip if PDF fails
+
+                # ── USER FEEDBACK ──
+                if total > 0:
+                    st.markdown('<div class="sec-title">Feedback</div>', unsafe_allow_html=True)
+                    st.caption("Help improve detection — mark any false positives")
+                    for i, d in enumerate(all_defects[:20]):
+                        col_desc, col_btn = st.columns([4, 1])
+                        with col_desc:
+                            st.text(f"{d.get('Type', 'Unknown')} | {d.get('Confidence', '')} | {d.get('Inspector', '')}")
+                        with col_btn:
+                            if st.button("❌ False Positive", key=f"fb_{i}"):
+                                save_feedback({
+                                    "timestamp": datetime.now().isoformat(),
+                                    "filename": getattr(img_file, 'name', 'unknown'),
+                                    "defect_type": d.get("Type", ""),
+                                    "confidence": d.get("Confidence", ""),
+                                    "inspector": d.get("Inspector", ""),
+                                    "action": "false_positive"
+                                })
+                                st.toast("✓ Feedback saved", icon="✅")
 
                 # Save to history
                 save_history({
@@ -720,6 +959,14 @@ with tab_batch:
             cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred]
             csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
             st.download_button("⬇  Download Batch Report", csv, "batch_report.csv", mime="text/csv")
+
+            # ── DEFECT CLUSTER HEATMAP ──
+            heatmap_img = generate_defect_heatmap(all_batch_defects)
+            if heatmap_img is not None:
+                st.markdown('<div class="sec-title">🔥 Defect Cluster Heatmap</div>', unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.caption("Aggregate view — brighter regions have more defects across all images")
+                    st.image(heatmap_img, channels="BGR", use_container_width=True)
 
 
 # ══════════════════════════════════════════════
