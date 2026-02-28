@@ -1,8 +1,8 @@
 """
 FabricQA — Automated Fabric Defect Detection
 ==============================================
-Upload an image → all inspectors run → results categorized
-into Structural (red) and Surface (yellow) defects.
+Upload an image → Unified Processor routes to correct engines
+→ results categorized into Group I (Structure) and Group II (Stitch).
 """
 
 import streamlit as st
@@ -18,17 +18,37 @@ from datetime import datetime
 from fpdf import FPDF
 
 from inspectors import texture_inspector, spectral_inspector, seam_inspector, edge_inspector
+from inspectors.unified_processor import unified_processor
 
 # ──────────────────────────────────────────────
-# DEFECT CLASSIFICATION MAP
+# DEFECT CLASSIFICATION MAP (10-Type Taxonomy)
 # ──────────────────────────────────────────────
-STRUCTURAL_TYPES = {
+# Group I: Fabric Structure defects (physical / pattern anomalies)
+GROUP_I_TYPES = {
+    "Missing Thread", "Slub", "Oil Stain",
+    "Hole", "Tear", "Snag",
+    # Legacy names (backward compat)
     "Cut / Tear (Horiz)", "Cut / Tear (Vert)",
     "Horizontal Tear/Thread", "Vertical Tear/Thread",
-    "Ragged Hole", "Skip Stitch",
-    "Structural Break", "Weave Irregularity",
+    "Ragged Hole", "Structural Break", "Weave Irregularity",
+    "Oil / Water Stain", "Texture Defect", "Rough Weave",
+    "Texture Anomaly",
+}
+# Group II: Stitch Quality defects (seam-related)
+GROUP_II_TYPES = {
+    "Skip Stitch", "Broken Stitch", "Run-off Stitch",
+    "Crooked Stitch", "Pucker",
+}
+# Structural = physically damaging; Surface = visual/textural
+STRUCTURAL_TYPES = {
+    "Missing Thread", "Hole", "Tear", "Snag",
+    "Skip Stitch", "Broken Stitch", "Run-off Stitch", "Crooked Stitch",
+    "Cut / Tear (Horiz)", "Cut / Tear (Vert)",
+    "Horizontal Tear/Thread", "Vertical Tear/Thread",
+    "Ragged Hole", "Structural Break", "Weave Irregularity",
 }
 SURFACE_TYPES = {
+    "Slub", "Oil Stain", "Pucker",
     "Oil / Water Stain", "Texture Defect", "Rough Weave",
     "Texture Anomaly", "Wrinkle / Fold (Horiz)", "Wrinkle / Fold (Vert)",
     "Deviation",
@@ -42,7 +62,7 @@ def classify_defect(defect_type: str) -> str:
         return "Surface"
     # fallback heuristic
     low = defect_type.lower()
-    if any(k in low for k in ("tear", "hole", "cut", "stitch", "break", "weave")):
+    if any(k in low for k in ("tear", "hole", "cut", "stitch", "break", "weave", "thread", "snag")):
         return "Structural"
     return "Surface"
 
@@ -664,6 +684,9 @@ with tab_inspect:
             conf_threshold = st.slider("Confidence threshold (%)", 0, 80, 30, 5,
                                        help="Defects below this confidence are filtered out",
                                        key="conf_slider")
+            remove_shadows_ui = st.checkbox("Remove Shadows (Illumination Correction)", value=False,
+                                            help="Enable this if uneven lighting is causing false positive defects",
+                                            key="shadow_toggle")
 
     # ── PROCESS ──
     if img_file is not None:
@@ -672,37 +695,20 @@ with tab_inspect:
             st.warning(validation_error)
         elif orig_img is not None:
             try:
-                all_defects = []
-                progress = st.progress(0, text="⏳ Starting inspection…")
+                progress = st.progress(0, text="⏳ Starting unified inspection…")
 
-                # 1. Texture
-                progress.progress(0.0, text="🧵  Analyzing texture (LBP + Gabor)…")
+                # ── UNIFIED PROCESSOR: Intelligent Routing Pipeline ──
+                progress.progress(0.1, text="🔍  Pre-classifying image region…")
                 buf = clone_buffer(img_file)
-                _, _, ent_map, _, tex_defs = texture_inspector.detect_defects(buf, sensitivity=sensitivity)
-                for d in tex_defs: d["Inspector"] = "Texture"
-                all_defects.extend(tex_defs)
-
-                # 2. Spectral
-                progress.progress(0.25, text="📡  Spectral analysis (Multi-Res FFT)…")
-                buf = clone_buffer(img_file)
-                _, _, sal_map, spec_defs = spectral_inspector.detect_defects(buf, sensitivity=sensitivity)
-                for d in spec_defs: d["Inspector"] = "Spectral"
-                all_defects.extend(spec_defs)
-
-                # 3. Seam
-                progress.progress(0.50, text="🪡  Seam / stitch detection…")
-                buf = clone_buffer(img_file)
-                _, _, _, _, seam_defs = seam_inspector.detect_defects(buf)
-                for d in seam_defs: d["Inspector"] = "Seam"
-                all_defects.extend(seam_defs)
-
-                # 4. Edge
-                progress.progress(0.75, text="📐  Edge / structure analysis…")
-                buf = clone_buffer(img_file)
-                _, _, anomaly_heatmap, _, edge_defs = edge_inspector.detect_defects(buf, sensitivity=sensitivity)
-                for d in edge_defs: d["Inspector"] = "Edge"
-                all_defects.extend(edge_defs)
-
+                
+                progress.progress(0.2, text="🧠  Routing to detection engines…")
+                result = unified_processor.process(buf, sensitivity=sensitivity, mode="full", remove_shadows=remove_shadows_ui)
+                
+                progress.progress(0.9, text="📊  Compiling results…")
+                all_defects = result["defects"]
+                viz_maps = result["viz_maps"]
+                routing_info = result["routing_info"]
+                
                 progress.progress(1.0, text="✅  Inspection complete!")
 
                 # ── CLASSIFY & FILTER ──
@@ -728,6 +734,15 @@ with tab_inspect:
                 total = s_count + f_count
                 verdict = "PASS" if total == 0 else "FAIL"
                 badge = '<span class="badge-pass">✓ PASS</span>' if total == 0 else '<span class="badge-fail">✗ FAIL</span>'
+
+                # ── ROUTING INFO ──
+                with st.expander("🧠 Routing Details", expanded=False):
+                    pre_info = routing_info.get("pre_classification", {})
+                    st.markdown(f"""
+                    **Pre-classification:** Seam detected: `{pre_info.get('has_seam', False)}` · Fabric body: `{pre_info.get('has_fabric_body', True)}`  
+                    **Engines used:** {', '.join(routing_info.get('engines_used', []))}  
+                    **Defect types found:** {', '.join(result['summary'].get('defect_types_found', [])) or 'None'}
+                    """)
 
                 # ── METRICS ──
                 st.markdown(f"""
@@ -773,15 +788,26 @@ with tab_inspect:
 
                 # ── DIAGNOSTIC MAPS ──
                 st.markdown('<div class="sec-title">Diagnostic Maps</div>', unsafe_allow_html=True)
-                mc1, mc2 = st.columns(2)
-                with mc1:
-                    with st.container(border=True):
-                        st.caption("Entropy Heatmap (Texture)")
-                        st.image(cv2.applyColorMap(ent_map, cv2.COLORMAP_JET), channels="BGR", use_container_width=True)
-                with mc2:
-                    with st.container(border=True):
-                        st.caption("Saliency Map (Spectral)")
-                        st.image(sal_map, channels="BGR", use_container_width=True)
+                map_cols = st.columns(min(3, max(1, len(viz_maps))))
+                map_items = list(viz_maps.items())
+                map_labels = {
+                    "entropy": "🧵 Entropy Heatmap (Texture)",
+                    "saliency": "📡 Saliency Map (Spectral)",
+                    "anomaly_heatmap": "📐 Anomaly Heatmap (Edge)",
+                    "seam_output": "🪡 Seam Detection Output",
+                }
+                for idx, (key, viz_img) in enumerate(map_items):
+                    col_idx = idx % len(map_cols)
+                    with map_cols[col_idx]:
+                        with st.container(border=True):
+                            label = map_labels.get(key, key.replace("_", " ").title())
+                            st.caption(label)
+                            if viz_img is not None:
+                                # Apply colormap if grayscale
+                                if len(viz_img.shape) == 2:
+                                    viz_img = cv2.applyColorMap(viz_img, cv2.COLORMAP_JET)
+                                st.image(viz_img, channels="BGR", use_container_width=True)
+
 
                 # ── DEFECT TABLES ──
                 st.markdown('<div class="sec-title">Defect Report</div>', unsafe_allow_html=True)
@@ -793,7 +819,7 @@ with tab_inspect:
                     if structural:
                         st.markdown('<div class="cat-hdr cat-structural">🔴  Structural Defects — Physical Damage</div>', unsafe_allow_html=True)
                         df_s = pd.DataFrame(structural)
-                        preferred = ["Category", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
+                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
                         cols_order = [c for c in preferred if c in df_s.columns] + [c for c in df_s.columns if c not in preferred and not c.startswith("bbox")]
                         with st.container(border=True):
                             st.dataframe(df_s[cols_order], use_container_width=True)
@@ -801,14 +827,14 @@ with tab_inspect:
                     if surface:
                         st.markdown('<div class="cat-hdr cat-surface">🟡  Surface Defects — Visual / Textural</div>', unsafe_allow_html=True)
                         df_f = pd.DataFrame(surface)
-                        preferred = ["Category", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
+                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
                         cols_order = [c for c in preferred if c in df_f.columns] + [c for c in df_f.columns if c not in preferred and not c.startswith("bbox")]
                         with st.container(border=True):
                             st.dataframe(df_f[cols_order], use_container_width=True)
 
                     # Combined download
                     df_all = pd.DataFrame(all_defects)
-                    preferred = ["Category", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
+                    preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
                     cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred and not c.startswith("bbox")]
                     csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
                     st.download_button("⬇  Download Full Report (CSV)", csv, "fabricqa_report.csv", mime="text/csv")
@@ -877,6 +903,7 @@ with tab_batch:
             key="batch_upload",
         )
         batch_sens = st.slider("Sensitivity", 1.0, 5.0, 2.5, 0.1, key="batch_sens")
+        batch_shadows = st.checkbox("Remove Shadows", value=False, key="batch_shadows")
 
     if batch_files:
         st.markdown('<div class="sec-title">Batch Results</div>', unsafe_allow_html=True)
@@ -893,23 +920,10 @@ with tab_batch:
                 continue
 
             try:
-                defects = []
-                # Texture
+                # ── UNIFIED PROCESSOR (Batch) ──
                 buf = clone_buffer(bf)
-                _, _, _, _, defs = texture_inspector.detect_defects(buf, sensitivity=batch_sens)
-                defects.extend(defs)
-                # Spectral
-                buf = clone_buffer(bf)
-                _, _, _, defs = spectral_inspector.detect_defects(buf, sensitivity=batch_sens)
-                defects.extend(defs)
-                # Seam
-                buf = clone_buffer(bf)
-                _, _, _, _, defs = seam_inspector.detect_defects(buf)
-                defects.extend(defs)
-                # Edge
-                buf = clone_buffer(bf)
-                _, _, _, _, defs = edge_inspector.detect_defects(buf, sensitivity=batch_sens)
-                defects.extend(defs)
+                result = unified_processor.process(buf, sensitivity=batch_sens, mode="full", remove_shadows=batch_shadows)
+                defects = result["defects"]
 
                 for d in defects:
                     d["Category"] = classify_defect(d.get("Type", ""))
