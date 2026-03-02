@@ -163,35 +163,32 @@ class SeamInspector:
                     gap_counter = 0
 
         # ── FIX: Run-off detection ──
-        # Run-off means stitching that goes OFF the edge (continues to the
-        # very boundary without a natural end). The density should be HIGH
-        # at the image edge instead of tapering off.
+        # A normal continuous seam will have left_density ≈ center_density.
+        # A true run-off means the stitch slipped off the fabric edge and became loose,
+        # resulting in a sharp DROP in density (but not a complete break to 0).
         edge_margin = int(w * self.runoff_edge_margin)
         if edge_margin > 5 and w > 2 * edge_margin:
             center_density = np.mean(proj[edge_margin : -edge_margin])
 
-            # Left edge: if stitching exists at the edge AND doesn't naturally
-            # end (density still significant at the boundary)
+            # Left edge
             left_density = np.mean(proj[:edge_margin])
-            if center_density > 5 and left_density > center_density * 0.6:
-                # Stitch doesn't taper at the left edge → run-off
+            if center_density > 5 and 0 < left_density < center_density * 0.35:
                 defects.append({
                     "x": 0, "y": 10,
                     "w": edge_margin, "h": h - 20,
                     "type": "Run-off Stitch",
-                    "score": int(left_density),
+                    "score": int((1.0 - (left_density / center_density)) * 100),
                 })
 
             # Right edge
             right_density = np.mean(proj[-edge_margin:])
-            if center_density > 5 and right_density > center_density * 0.6:
+            if center_density > 5 and 0 < right_density < center_density * 0.35:
                 defects.append({
                     "x": w - edge_margin, "y": 10,
                     "w": edge_margin, "h": h - 20,
                     "type": "Run-off Stitch",
-                    "score": int(right_density),
+                    "score": int((1.0 - (right_density / center_density)) * 100),
                 })
-
         return defects
 
     # ──────────────────────────────────────────
