@@ -1,24 +1,25 @@
 """
 Unified Defect Processor — Intelligent Routing Pipeline
 ========================================================
-Routes fabric images to the correct detection engine based on defect type.
+Routes fabric images to the correct detection engine based on image content.
 
 Architecture:
-    Input Image → Pre-classifier → Group Router → Detection Engines → Sub-classifier → Unified Result
+    Input Image → Shadow Removal → Pre-classifier → Group Router
+                → Detection Engines → Sub-classifier → NMS → Unified Result
 
 Groups:
-    Group I  (Fabric Structure): FFT + Canny/Morphology
-    Group II (Stitch Quality):   Projection + Regression + Laplacian
+    Group I  (Fabric Structure): Spectral + Texture + Edge engines
+    Group II (Stitch Quality):   Projection + Regression + Laplacian engines
 
-Output Schema:
-    {group, defect_type, confidence, engine_used, bbox, area, ...}
+Output schema per defect:
+    {ID, Group, Engine, Inspector, Type, Area, Confidence, Solidity, bbox_*}
 """
 
 import cv2
 import numpy as np
 import logging
 from io import BytesIO
-from typing import List, Dict, Any, BinaryIO, Optional, Tuple
+from typing import List, Dict, Any, BinaryIO, Tuple
 
 from config import DEFECT_TYPES, UNIFIED_SETTINGS
 from inspectors.spectral_inspector import SpectralInspector
@@ -30,412 +31,339 @@ logger = logging.getLogger(__name__)
 
 
 class UnifiedProcessor:
-    """
-    Intelligent routing processor for fabric defect detection.
-    
-    Instead of running all engines on every image, it:
-    1. Pre-classifies the image (fabric body vs seam region)
-    2. Routes to the appropriate detection engines
-    3. Sub-classifies detected anomalies into the 10-type taxonomy
-    4. Returns a unified result schema
-    """
+    """Intelligent routing processor for fabric defect detection."""
 
     DEFECT_TAXONOMY = DEFECT_TYPES
 
     def __init__(self):
-        # Initialize all engines (lazy — they're lightweight)
         self._spectral = SpectralInspector()
         self._edge = EdgeInspector()
         self._texture = TextureInspector()
         self._seam = SeamInspector()
-        
-        # Unified settings
         self._cfg = UNIFIED_SETTINGS
         self._seam_thresh = self._cfg.get("SEAM_DETECTION_THRESH", 0.3)
 
-    # ──────────────────────────────────────────────
-    # IMAGE PRE-PROCESSING (SHADOW / ILLUMINATION)
-    # ──────────────────────────────────────────────
+    # ──────────────────────────────────────────
+    # Shadow / Illumination removal
+    # ──────────────────────────────────────────
     def _remove_shadows(self, img_bytes: bytes) -> bytes:
-        """
-        Removes uneven illumination (shadows) via morphological background estimation.
-        Decodes the image, estimates the bright fabric background, normalizes,
-        and re-encodes back to bytes so inspectors run unmodified.
+        """Morphological background estimation in LAB L-channel
+        (avoids the colour-shift issue of the old HSV approach).
         """
         img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return img_bytes
-            
-        # Convert to HSV to process only the V (brightness) channel without shifting colors
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        v = hsv[:,:,2]
-        
-        # Estimate background illumination:
-        # 1. Morphological dilation to wipe out dark defects (threads, holes) and keep the background level
-        # A large kernel ensures large defects are erased from background estimation
-        # We scale kernel size based on image width to remain robust
-        k_size = max(31, (img.shape[1] // 20) | 1) # Must be odd
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-        bg = cv2.morphologyEx(v, cv2.MORPH_DILATE, kernel)
-        
-        # 2. Strong Gaussian blur to smooth the illumination mask into a perfect gradient/shadow map
-        bg = cv2.GaussianBlur(bg, (k_size, k_size), 0)
-        
-        # Avoid division by zero
-        bg[bg == 0] = 1
-        
-        # Normalize original brightness by estimated background shadow
-        normalized = (v.astype(np.float32) / bg.astype(np.float32)) * 255
-        hsv[:,:,2] = np.clip(normalized, 0, 255).astype(np.uint8)
-        
-        img_corrected = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        
-        # Encode back to PNG buffer
-        success, encoded = cv2.imencode('.png', img_corrected)
-        if success:
-            return encoded.tobytes()
-        return img_bytes
 
-    # ──────────────────────────────────────────────
-    # PRE-CLASSIFIER
-    # ──────────────────────────────────────────────
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_chan = lab[:, :, 0]
+
+        k_size = max(31, (img.shape[1] // 20) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        bg = cv2.morphologyEx(l_chan, cv2.MORPH_DILATE, kernel)
+        bg = cv2.GaussianBlur(bg, (k_size, k_size), 0)
+        bg[bg == 0] = 1
+
+        normalized = (l_chan.astype(np.float32) / bg.astype(np.float32)) * 255
+        lab[:, :, 0] = np.clip(normalized, 0, 255).astype(np.uint8)
+
+        corrected = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        ok, encoded = cv2.imencode(".png", corrected)
+        return encoded.tobytes() if ok else img_bytes
+
+    # ──────────────────────────────────────────
+    # Pre-classifier
+    # ──────────────────────────────────────────
     def _pre_classify(self, img_gray: np.ndarray) -> Dict[str, bool]:
-        """
-        Lightweight pre-classifier to determine region types present.
-        
-        Returns dict: {"has_seam": bool, "has_fabric_body": bool}
-        
-        Logic:
-        - Seam: Detected via horizontal projection profiling.
-          If there's a strong, narrow horizontal band of high/low intensity → seam.
-        - Fabric body: Always True if not exclusively a seam strip.
+        """Determine whether a seam region and/or fabric body are present.
+
+        FIX: gradient threshold lowered from 0.6 to a tunable value
+        so real seams are not rejected.
         """
         h, w = img_gray.shape[:2]
-        
-        # Horizontal projection: sum intensities per row
         h_proj = np.mean(img_gray, axis=1)
-        
-        # Normalize projection
-        p_min, p_max = np.min(h_proj), np.max(h_proj)
+
+        p_min, p_max = float(np.min(h_proj)), float(np.max(h_proj))
         if p_max - p_min < 10:
             return {"has_seam": False, "has_fabric_body": True}
-        
+
         h_proj_norm = (h_proj - p_min) / (p_max - p_min)
-        
-        # Look for a narrow band (< 20% of image height) with distinctly 
-        # different intensity than surroundings
-        # A seam creates a sharp peak or valley in the projection
         grad = np.abs(np.gradient(h_proj_norm))
-        
-        # Find strong gradient transitions (seam edges)
-        # We increase the required strength threshold dramatically: a real seam
-        # stands out heavily compared to the typical background weave.
-        strong_edges = np.where(grad > max(0.4, self._seam_thresh * 2))[0]
-        
+
+        # FIX: lower gradient threshold — the old code used max(0.4, thresh*2)
+        # which was 0.6 with the default 0.3, causing real seams to be ignored.
+        edge_thresh = max(0.15, self._seam_thresh)
+        strong_edges = np.where(grad > edge_thresh)[0]
+
         has_seam = False
         if len(strong_edges) >= 2:
-            # Check if there are paired edges close together (forming a band)
             for i in range(len(strong_edges) - 1):
                 band_width = strong_edges[i + 1] - strong_edges[i]
-                if 15 < band_width < h * 0.35:  # Between 15px and 35% of height
-                    # STRICT CHECK: A real seam band has relatively uniform intensity inside it
-                    # compared to the sharp edges bounding it.
-                    start_idx = strong_edges[i]
-                    end_idx = strong_edges[i+1]
-                    band_slice = h_proj_norm[start_idx:end_idx]
-                    
-                    if len(band_slice) > 5:
-                        band_std = np.std(band_slice)
-                        if band_std < 0.2: # Must be relatively uniform inside the band
-                            has_seam = True
-                            break
-        
-        # Fabric body is present unless the image is entirely a zoomed seam
-        has_fabric_body = True
-        
-        return {"has_seam": has_seam, "has_fabric_body": has_fabric_body}
+                if 10 < band_width < h * 0.40:
+                    band_slice = h_proj_norm[strong_edges[i] : strong_edges[i + 1]]
+                    if len(band_slice) > 3 and np.std(band_slice) < 0.25:
+                        has_seam = True
+                        break
 
-    # ──────────────────────────────────────────────
-    # SUB-CLASSIFIERS
-    # ──────────────────────────────────────────────
+        return {"has_seam": has_seam, "has_fabric_body": True}
+
+    # ──────────────────────────────────────────
+    # Sub-classifiers
+    # ──────────────────────────────────────────
     def _sub_classify_spectral(self, defect: Dict[str, Any]) -> str:
-        """
-        Refine a spectral/texture anomaly into:
-        - Missing Thread: Linear anomaly (high aspect ratio, low solidity)
-        - Slub: Small, blob-like (moderate area, moderate solidity)
-        - Oil Stain: Round/solid (high solidity, moderate-large area)
-        """
-        orig_type = defect.get("Type", "")
-        # Prevent forcing everything into Structural if it's already a known texture issue
-        if "Anomaly" in orig_type or "Weave" in orig_type:
-            return "Texture Defect"
+        """Refine a spectral / texture detection into the 10-type taxonomy.
 
-        solidity = float(defect.get("Solidity", "0").replace("%", "")) if isinstance(
-            defect.get("Solidity"), str) else defect.get("Solidity", 0)
+        FIX: the old code short-circuited on "Anomaly" / "Weave" keywords
+        and returned "Texture Defect", bypassing the taxonomy.  Removed.
+        """
+        solidity = 0.0
+        sol_raw = defect.get("Solidity", "0")
+        try:
+            solidity = float(str(sol_raw).replace("%", ""))
+        except (ValueError, TypeError):
+            pass
+
         area = defect.get("Area (px)", 0)
-        
         bw = defect.get("bbox_w", 1)
         bh = defect.get("bbox_h", 1)
         aspect = bw / max(bh, 1)
-        
+
         sol_min = self._cfg.get("OIL_STAIN_SOLIDITY_MIN", 0.85)
-        
-        # High solidity + moderate/large area → Oil Stain
-        if solidity > sol_min:
+
+        if solidity > sol_min and 0.4 < aspect < 2.5:
             return "Oil Stain"
-        
-        # Very elongated → Missing Thread (linear gap in weave)
+
         if aspect > 3.0 or aspect < 0.33:
-            # Check confidence: if it's low confidence, it's just rough weave, not a missing thread
             conf_str = defect.get("Confidence", "0%")
-            conf = int(str(conf_str).replace("%", "")) if isinstance(conf_str, str) else conf_str
-            if conf < 40:
-                return "Rough Weave"
-            return "Missing Thread"
-        
-        # Default: Slub (thick/uneven yarn)
+            try:
+                conf = int(str(conf_str).replace("%", ""))
+            except (ValueError, TypeError):
+                conf = 0
+            return "Missing Thread" if conf >= 30 else "Slub"
+
         return "Slub"
 
     def _sub_classify_edge(self, defect: Dict[str, Any]) -> str:
-        """
-        Refine an edge/structural anomaly into:
-        - Hole: Large area, moderate solidity (complete perforation)
-        - Tear: Elongated shape (ripped along a line)
-        - Snag: Small area (pulled loop)
-        - Texture Defect: Natural fold/wrinkle misclassified by default
-        """
-        orig_type = defect.get("Type", "")
-        # If the original engine called it a Wrinkle or Weave Irregularity,
-        # it is a Surface defect, not a Structural Tear/Snag!
-        if "Wrinkle" in orig_type or "Weave" in orig_type:
-            return "Texture Defect"
+        """Refine an edge detection into Hole / Tear / Snag.
 
+        FIX: removed short-circuit on "Wrinkle" / "Weave" that returned
+        "Texture Defect" and prevented proper classification.
+        """
         area = defect.get("Area (px)", 0)
         bw = defect.get("bbox_w", 1)
         bh = defect.get("bbox_h", 1)
         aspect = bw / max(bh, 1)
-        
+
         tear_ar = self._cfg.get("TEAR_ASPECT_RATIO_MIN", 3.0)
         snag_max = self._cfg.get("SNAG_AREA_MAX", 800)
         hole_min = self._cfg.get("HOLE_AREA_MIN", 1000)
-        
-        # Very elongated → Tear
+
         if aspect > tear_ar or aspect < (1.0 / tear_ar):
             return "Tear"
-        
-        # Small area → Snag
         if area < snag_max:
             return "Snag"
-        
-        # Large area → Hole
         if area >= hole_min:
             return "Hole"
-        
-        # Medium area, not elongated → default Hole
         return "Hole"
 
-    # ──────────────────────────────────────────────
-    # GROUP ROUTERS
-    # ──────────────────────────────────────────────
-    def _route_group_i(self, img_buffer: BinaryIO, sensitivity: float
-                       ) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
+    # ──────────────────────────────────────────
+    # Internal NMS (deduplication)
+    # ──────────────────────────────────────────
+    @staticmethod
+    def _nms(defects: List[Dict[str, Any]], iou_thresh: float = 0.5) -> List[Dict[str, Any]]:
+        """Non-Maximum Suppression across engines to remove duplicates.
+
+        FIX: the old code had NO internal NMS — it relied entirely on
+        ``app.py`` to do it.  Now deduplicated inside the processor.
         """
-        Group I: Fabric Structure defects.
-        Runs Spectral (FFT) + Edge (Canny/Morphology) engines.
-        Sub-classifies results into the 6 Group I types.
-        """
-        defects = []
-        viz_maps = {}
-        
-        # Engine A: Spectral Residual (FFT) → Missing Thread, Slub, Oil Stain
+        if len(defects) <= 1:
+            return defects
+
+        def _conf(d: Dict[str, Any]) -> int:
+            c = d.get("Confidence", "0%")
+            try:
+                return int(str(c).replace("%", "").strip())
+            except (ValueError, TypeError):
+                return 0
+
+        def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+            ax1 = a.get("bbox_x", 0)
+            ay1 = a.get("bbox_y", 0)
+            ax2 = ax1 + a.get("bbox_w", 0)
+            ay2 = ay1 + a.get("bbox_h", 0)
+            bx1 = b.get("bbox_x", 0)
+            by1 = b.get("bbox_y", 0)
+            bx2 = bx1 + b.get("bbox_w", 0)
+            by2 = by1 + b.get("bbox_h", 0)
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = max(1, (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter)
+            return inter / union
+
+        sorted_defs = sorted(defects, key=_conf, reverse=True)
+        keep: List[Dict[str, Any]] = []
+        for d in sorted_defs:
+            if not any(_iou(d, k) >= iou_thresh for k in keep):
+                keep.append(d)
+        return keep
+
+    # ──────────────────────────────────────────
+    # Group routers
+    # ──────────────────────────────────────────
+    def _route_group_i(
+        self, img_buffer: BinaryIO, sensitivity: float
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Group I — Fabric Structure (Spectral + Texture + Edge)."""
+        defects: List[Dict[str, Any]] = []
+        viz_maps: Dict[str, Any] = {}
+
+        # Engine A: Spectral
         try:
             img_buffer.seek(0)
-            buf_copy = BytesIO(img_buffer.read())
+            buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            
-            _, _, sal_map, spec_defs = self._spectral.detect_defects(
-                buf_copy, sensitivity=sensitivity
-            )
+            _, _, sal_map, spec_defs = self._spectral.detect_defects(buf, sensitivity=sensitivity)
             viz_maps["saliency"] = sal_map
-            
             for d in spec_defs:
                 d["Engine"] = "Spectral (FFT)"
                 d["Group"] = "Fabric Structure"
-                # Sub-classify
+                d["Inspector"] = "Spectral"
                 if self._cfg.get("SUB_CLASSIFY", True):
                     d["Type"] = self._sub_classify_spectral(d)
-                d["Inspector"] = "Spectral"
-            
             defects.extend(spec_defs)
         except Exception as e:
-            logger.warning(f"Spectral engine failed: {e}")
+            logger.warning("Spectral engine failed: %s", e)
 
-        # Engine B: Texture (LBP + Gabor) → additional pattern anomalies
+        # Engine B: Texture
         try:
             img_buffer.seek(0)
-            buf_copy = BytesIO(img_buffer.read())
+            buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            
-            _, _, ent_map, _, tex_defs = self._texture.detect_defects(
-                buf_copy, sensitivity=sensitivity
-            )
+            _, _, ent_map, _, tex_defs = self._texture.detect_defects(buf, sensitivity=sensitivity)
             viz_maps["entropy"] = ent_map
-            
             for d in tex_defs:
                 d["Engine"] = "Texture (LBP+Gabor)"
                 d["Group"] = "Fabric Structure"
+                d["Inspector"] = "Texture"
                 if self._cfg.get("SUB_CLASSIFY", True):
                     d["Type"] = self._sub_classify_spectral(d)
-                d["Inspector"] = "Texture"
-            
             defects.extend(tex_defs)
         except Exception as e:
-            logger.warning(f"Texture engine failed: {e}")
+            logger.warning("Texture engine failed: %s", e)
 
-        # Engine C: Edge/Structural (Canny + Morphology) → Hole, Tear, Snag
+        # Engine C: Edge
         try:
             img_buffer.seek(0)
-            buf_copy = BytesIO(img_buffer.read())
+            buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            
-            _, _, anomaly_hm, _, edge_defs = self._edge.detect_defects(
-                buf_copy, sensitivity=sensitivity
-            )
+            _, _, anomaly_hm, _, edge_defs = self._edge.detect_defects(buf, sensitivity=sensitivity)
             viz_maps["anomaly_heatmap"] = anomaly_hm
-            
             for d in edge_defs:
                 d["Engine"] = "Edge (Canny+Morph)"
                 d["Group"] = "Fabric Structure"
+                d["Inspector"] = "Edge"
                 if self._cfg.get("SUB_CLASSIFY", True):
                     d["Type"] = self._sub_classify_edge(d)
-                d["Inspector"] = "Edge"
-            
             defects.extend(edge_defs)
         except Exception as e:
-            logger.warning(f"Edge engine failed: {e}")
-        
+            logger.warning("Edge engine failed: %s", e)
+
         return defects, viz_maps
 
-    def _route_group_ii(self, img_buffer: BinaryIO, sensitivity: float
-                        ) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
-        """
-        Group II: Stitch Quality defects.
-        Runs Seam Inspector (which internally runs Projection + Regression + Laplacian).
-        """
-        defects = []
-        viz_maps = {}
-        
+    def _route_group_ii(
+        self, img_buffer: BinaryIO, sensitivity: float  # noqa: ARG002
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Group II — Stitch Quality (Seam Inspector)."""
+        defects: List[Dict[str, Any]] = []
+        viz_maps: Dict[str, Any] = {}
+
         try:
             img_buffer.seek(0)
-            buf_copy = BytesIO(img_buffer.read())
+            buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            
-            _, _, _, seam_output, seam_defs = self._seam.detect_defects(buf_copy)
+            _, _, _, seam_output, seam_defs = self._seam.detect_defects(buf)
             viz_maps["seam_output"] = seam_output
-            
             for d in seam_defs:
                 d["Engine"] = f"Seam ({d.get('Type', 'Unknown')})"
                 d["Group"] = "Stitch Quality"
                 d["Inspector"] = "Seam"
-                # Type is already properly classified by the refactored seam inspector
-            
             defects.extend(seam_defs)
         except Exception as e:
-            logger.warning(f"Seam engine failed: {e}")
-        
+            logger.warning("Seam engine failed: %s", e)
+
         return defects, viz_maps
 
-    # ──────────────────────────────────────────────
-    # MAIN API
-    # ──────────────────────────────────────────────
+    # ──────────────────────────────────────────
+    # Main API
+    # ──────────────────────────────────────────
     def process(
         self,
         img_buffer: BinaryIO,
         sensitivity: float = 2.5,
         mode: str = "full",
-        remove_shadows: bool = False
+        remove_shadows: bool = False,
     ) -> Dict[str, Any]:
+        """Run the full Unified Pipeline.
+
+        Returns dict with keys: defects, group_i_defects, group_ii_defects,
+        viz_maps, routing_info, summary.
         """
-        Main entry point for the Unified Processor.
-        
-        Args:
-            img_buffer: Image file buffer
-            sensitivity: Detection sensitivity (1.0 - 5.0)
-            mode: "full" | "structure_only" | "seam_only"
-            remove_shadows: Whether to apply aggressive background illumination correction
-        
-        Returns:
-            {
-                "defects": [...],         # List of all detected defects
-                "group_i_defects": [...], # Fabric Structure defects only
-                "group_ii_defects": [...],# Stitch Quality defects only
-                "viz_maps": {...},        # Visualization maps for UI
-                "routing_info": {...},    # Pre-classifier results + engines used
-                "summary": {...}          # Counts and verdict
-            }
-        """
-        all_defects = []
-        all_viz_maps = {}
-        engines_used = []
-        
-        # Pre-process shadows if requested
+        all_defects: List[Dict[str, Any]] = []
+        all_viz_maps: Dict[str, Any] = {}
+        engines_used: List[str] = []
+
         img_buffer.seek(0)
         raw_bytes = img_buffer.read()
         if remove_shadows:
             raw_bytes = self._remove_shadows(raw_bytes)
-            
-        # Create a new buffer with the processed (or clean) bytes to feed the pipeline
+
         pipeline_buffer = BytesIO(raw_bytes)
-        
-        # Pre-classify (determine which groups to run)
+
+        # Pre-classify
         pre_bytes = np.asarray(bytearray(raw_bytes), dtype=np.uint8)
         img_pre = cv2.imdecode(pre_bytes, cv2.IMREAD_GRAYSCALE)
-        
         if img_pre is None:
             raise ValueError("Could not decode image file")
-        
+
         region_info = self._pre_classify(img_pre)
-        
-        # Determine which groups to run
+
         run_group_i = mode in ("full", "structure_only") or region_info["has_fabric_body"]
         run_group_ii = mode in ("full", "seam_only") or region_info["has_seam"]
-        
-        # In "full" mode, always run both regardless of pre-classifier
         if mode == "full":
             run_group_i = True
             run_group_ii = True
-        
-        # Route to engines using the pipeline_buffer (which is shadow-free if toggled)
+
         if run_group_i:
             engines_used.append("Group I: Fabric Structure")
             g1_defects, g1_viz = self._route_group_i(pipeline_buffer, sensitivity)
             all_defects.extend(g1_defects)
             all_viz_maps.update(g1_viz)
-        
+
         if run_group_ii:
             engines_used.append("Group II: Stitch Quality")
             g2_defects, g2_viz = self._route_group_ii(pipeline_buffer, sensitivity)
             all_defects.extend(g2_defects)
             all_viz_maps.update(g2_viz)
-        
+
+        # Internal NMS (deduplication across engines)
+        all_defects = self._nms(all_defects, iou_thresh=0.5)
+
         # Re-number IDs
         for i, d in enumerate(all_defects, 1):
             d["ID"] = i
-        
-        # Split by group
+
         group_i = [d for d in all_defects if d.get("Group") == "Fabric Structure"]
         group_ii = [d for d in all_defects if d.get("Group") == "Stitch Quality"]
-        
-        # Build summary
+
         total = len(all_defects)
         summary = {
             "total_defects": total,
             "group_i_count": len(group_i),
             "group_ii_count": len(group_ii),
             "verdict": "PASS" if total == 0 else "FAIL",
-            "defect_types_found": list(set(d.get("Type", "Unknown") for d in all_defects)),
+            "defect_types_found": sorted(set(d.get("Type", "Unknown") for d in all_defects)),
         }
-        
+
         return {
             "defects": all_defects,
             "group_i_defects": group_i,
@@ -450,7 +378,6 @@ class UnifiedProcessor:
         }
 
     def get_taxonomy(self) -> Dict[str, Any]:
-        """Return the full defect taxonomy for UI display."""
         return self.DEFECT_TAXONOMY
 
 

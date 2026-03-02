@@ -1,15 +1,17 @@
 """
-Edge / Structural Inspector Module
-===================================
-Detects structural/geometric defects like wrinkles, folds, and broken weave
-lines using classical edge detection and line analysis.
+Edge / Structural Inspector Module (Algorithm C)
+=================================================
+Detects structural/geometric defects like holes, tears, and snags using
+classical edge detection and line-spacing regularity analysis.
 
 Algorithm:
-1. Canny edge detection with automatic thresholding (Otsu's method).
-2. Hough Line Transform to detect dominant weave lines.
-3. Line spacing regularity analysis — irregular spacing = structural defect.
-4. Laplacian variance per patch for wrinkle/fold detection (local blur/sharpness).
-5. Combined anomaly mask from both methods.
+1. CLAHE illumination correction.
+2. Canny edge detection (auto-threshold via Otsu).
+3. Hough Line Transform → dominant weave-line spacing analysis.
+4. Per-patch Laplacian variance → detects ruptures and structural changes.
+5. Combined anomaly mask → connected-component extraction.
+
+Detects: Holes, Tears, Snags.
 """
 
 import cv2
@@ -20,16 +22,20 @@ from typing import Tuple, List, Dict, Any, BinaryIO
 class EdgeInspector:
     """Detects structural defects using edge analysis and Laplacian variance."""
 
-    RESIZE_WIDTH = 800
+    PROCESS_WIDTH = 800
     PATCH_SIZE = 48
-    PATCH_STEP = 24  # 50% overlap
+    PATCH_STEP = 24  # 50 % overlap
 
     def __init__(self):
-        self.defects = []
+        self.defects: List[Dict[str, Any]] = []
 
-    def _preprocess(self, img_buffer: BinaryIO) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """Standardize input resolution and color space."""
-        if hasattr(img_buffer, 'seek'):
+    # ──────────────────────────────────────────
+    # Pre-processing
+    # ──────────────────────────────────────────
+    def _preprocess(
+        self, img_buffer: BinaryIO
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        if hasattr(img_buffer, "seek"):
             img_buffer.seek(0)
 
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
@@ -38,81 +44,70 @@ class EdgeInspector:
             raise ValueError("Could not decode image file")
 
         h, w = img.shape[:2]
-        scale = self.RESIZE_WIDTH / w
+        scale = self.PROCESS_WIDTH / w
         target_h = int(h * scale)
 
-        img_small = cv2.resize(img, (self.RESIZE_WIDTH, target_h))
+        img_small = cv2.resize(img, (self.PROCESS_WIDTH, target_h))
         img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
 
-        # CLAHE for illumination correction
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         img_gray = clahe.apply(img_gray)
 
         return img, img_small, img_gray, scale
 
+    # ──────────────────────────────────────────
+    # Laplacian variance map
+    # ──────────────────────────────────────────
     def _compute_laplacian_variance_map(self, img_gray: np.ndarray) -> np.ndarray:
-        """Compute per-patch Laplacian variance to detect wrinkles and folds.
-        
-        Wrinkles cause local blur or unusual sharpness changes.
-        Patches with variance far from the image mean are flagged.
-        """
+        """Per-patch Laplacian variance — sharp edges / ruptures spike here."""
         h, w = img_gray.shape
         var_map = np.zeros((h, w), dtype=np.float32)
         count_map = np.zeros((h, w), dtype=np.float32)
 
         for y in range(0, h - self.PATCH_SIZE, self.PATCH_STEP):
             for x in range(0, w - self.PATCH_SIZE, self.PATCH_STEP):
-                patch = img_gray[y:y + self.PATCH_SIZE, x:x + self.PATCH_SIZE]
-                lap = cv2.Laplacian(patch, cv2.CV_64F)
-                var = lap.var()
-                var_map[y:y + self.PATCH_SIZE, x:x + self.PATCH_SIZE] += var
-                count_map[y:y + self.PATCH_SIZE, x:x + self.PATCH_SIZE] += 1
+                patch = img_gray[y : y + self.PATCH_SIZE, x : x + self.PATCH_SIZE]
+                var = cv2.Laplacian(patch, cv2.CV_64F).var()
+                var_map[y : y + self.PATCH_SIZE, x : x + self.PATCH_SIZE] += var
+                count_map[y : y + self.PATCH_SIZE, x : x + self.PATCH_SIZE] += 1
 
-        # Average overlapping patches
         count_map[count_map == 0] = 1
-        var_map = var_map / count_map
+        return var_map / count_map
 
-        return var_map
-
+    # ──────────────────────────────────────────
+    # Hough line regularity
+    # ──────────────────────────────────────────
     def _analyze_line_regularity(self, img_gray: np.ndarray) -> np.ndarray:
-        """Use Hough Lines to detect dominant weave lines and flag irregular spacing.
-        
-        Returns a binary anomaly mask where irregular line gaps are marked.
-        """
+        """Flag regions where weave-line spacing is irregular."""
         h, w = img_gray.shape
         anomaly_mask = np.zeros((h, w), dtype=np.uint8)
 
-        # Auto-threshold Canny using Otsu's method
         otsu_thresh, _ = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        low_thresh = int(otsu_thresh * 0.5)
-        high_thresh = int(otsu_thresh)
-        edges = cv2.Canny(img_gray, low_thresh, high_thresh)
+        edges = cv2.Canny(img_gray, int(otsu_thresh * 0.5), int(otsu_thresh))
 
-        # Detect lines
+        # FIX: less strict Hough params to capture shorter defect-related lines
         lines = cv2.HoughLinesP(
-            edges, rho=1, theta=np.pi / 180, threshold=80,
-            minLineLength=w // 4, maxLineGap=20
+            edges, rho=1, theta=np.pi / 180, threshold=60,
+            minLineLength=w // 6, maxLineGap=25,
         )
 
         if lines is None or len(lines) < 3:
             return anomaly_mask
 
-        # Separate horizontal and vertical lines
-        h_lines = []
-        v_lines = []
+        h_lines: List[int] = []
+        v_lines: List[int] = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
             angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
             if angle < 30:
-                h_lines.append((y1 + y2) // 2)  # y-center
+                h_lines.append((y1 + y2) // 2)
             elif angle > 60:
-                v_lines.append((x1 + x2) // 2)  # x-center
+                v_lines.append((x1 + x2) // 2)
 
-        # Analyze spacing regularity for whichever group has more lines
-        for positions, axis in [(sorted(h_lines), 'h'), (sorted(v_lines), 'v')]:
+        for positions, axis in [(sorted(h_lines), "h"), (sorted(v_lines), "v")]:
             if len(positions) < 3:
                 continue
-            spacings = np.diff(positions)
+            spacings = np.diff(positions).astype(float)
             if len(spacings) < 2:
                 continue
             mean_sp = np.mean(spacings)
@@ -122,50 +117,49 @@ class EdgeInspector:
 
             for i, sp in enumerate(spacings):
                 z = abs(sp - mean_sp) / max(std_sp, 1e-6)
-                if z > 2.0:  # irregular gap
+                if z > 2.0:
                     pos = positions[i]
-                    if axis == 'h':
-                        gap = int(sp)
-                        anomaly_mask[max(0, pos):min(h, pos + gap), :] = 255
+                    gap = int(sp)
+                    if axis == "h":
+                        anomaly_mask[max(0, pos) : min(h, pos + gap), :] = 255
                     else:
-                        gap = int(sp)
-                        anomaly_mask[:, max(0, pos):min(w, pos + gap)] = 255
+                        anomaly_mask[:, max(0, pos) : min(w, pos + gap)] = 255
 
         return anomaly_mask
 
+    # ──────────────────────────────────────────
+    # Main pipeline
+    # ──────────────────────────────────────────
     def detect_defects(
         self,
         img_buffer: BinaryIO,
         sensitivity: float = 2.0,
-        min_area: int = 800
+        min_area: int = 800,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-        """
-        Main pipeline.
-        
-        Returns: (original, edge_map, anomaly_heatmap, annotated_result, defect_list)
-        """
+        """Returns (original, edge_viz, anomaly_heatmap, annotated, defects)."""
         original, img_small, img_gray, scale = self._preprocess(img_buffer)
         h, w = img_gray.shape
 
-        # 1. Laplacian variance map
+        # 1. Raw Laplacian variance map (float)
         var_map = self._compute_laplacian_variance_map(img_gray)
         mean_var = np.mean(var_map)
         std_var = np.std(var_map)
 
-        # Z-score thresholding on Laplacian variance
-        # Both very low (blurry/folded) and very high (sharp edges/tears) are anomalies
-        lower_bound = mean_var - (sensitivity * std_var)
-        upper_bound = mean_var + (sensitivity * std_var)
+        # ── FIX: Z-score thresholding on the RAW variance map ──
+        # Build a binary mask directly from statistical outliers of the
+        # raw float variance, avoiding the old normalization mismatch.
+        if std_var > 1e-6:
+            z_map = np.abs(var_map - mean_var) / std_var
+        else:
+            z_map = np.zeros_like(var_map)
 
-        var_norm = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        mask_low = cv2.inRange(var_norm, 0, int(max(0, lower_bound / max(mean_var, 1) * 128)))
-        mask_high = cv2.inRange(var_norm, int(min(255, upper_bound / max(mean_var, 1) * 128)), 255)
-        laplacian_mask = cv2.bitwise_or(mask_low, mask_high)
+        laplacian_mask = np.zeros((h, w), dtype=np.uint8)
+        laplacian_mask[z_map > sensitivity] = 255
 
         # 2. Line regularity analysis
         line_mask = self._analyze_line_regularity(img_gray)
 
-        # 3. Combine both masks
+        # 3. Combine
         combined_mask = cv2.bitwise_or(laplacian_mask, line_mask)
 
         # 4. Morphological cleanup
@@ -174,11 +168,9 @@ class EdgeInspector:
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=2)
 
         # 5. Extract defects
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            combined_mask, connectivity=8
-        )
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined_mask, connectivity=8)
 
-        defect_list = []
+        defect_list: List[Dict[str, Any]] = []
         result = original.copy()
 
         for i in range(1, num_labels):
@@ -187,35 +179,38 @@ class EdgeInspector:
             if real_area < min_area:
                 continue
 
-            x = int(stats[i, cv2.CC_STAT_LEFT] / scale)
-            y = int(stats[i, cv2.CC_STAT_TOP] / scale)
-            bw = int(stats[i, cv2.CC_STAT_WIDTH] / scale)
-            bh = int(stats[i, cv2.CC_STAT_HEIGHT] / scale)
-            x, y = max(0, x), max(0, y)
+            bx = max(0, int(stats[i, cv2.CC_STAT_LEFT] / scale))
+            by = max(0, int(stats[i, cv2.CC_STAT_TOP] / scale))
+            bw = max(1, int(stats[i, cv2.CC_STAT_WIDTH] / scale))
+            bh = max(1, int(stats[i, cv2.CC_STAT_HEIGHT] / scale))
 
             aspect_ratio = float(bw) / max(bh, 1)
 
-            # Classify defect type
-            if aspect_ratio > 4.0:
-                name = "Wrinkle / Fold (Horiz)"
-                color = (0, 200, 200)  # Yellow
-            elif aspect_ratio < 0.25:
-                name = "Wrinkle / Fold (Vert)"
+            # ── FIX: Use 10-type taxonomy names ──
+            if aspect_ratio > 3.0 or aspect_ratio < 0.33:
+                name = "Tear"
+                color = (0, 0, 255)
+            elif real_area < 800:
+                name = "Snag"
                 color = (0, 200, 200)
-            elif real_area > 5000:
-                name = "Structural Break"
-                color = (0, 0, 255)  # Red
+            elif real_area >= 1000:
+                name = "Hole"
+                color = (255, 0, 0)
             else:
-                name = "Weave Irregularity"
-                color = (255, 128, 0)  # Blue-ish
+                name = "Hole"
+                color = (255, 128, 0)
 
-            # Confidence from Z-score
-            region_mask = (labels == i)
-            region_var = var_map[region_mask[:h, :w]] if region_mask.shape == var_map.shape else []
+            # Confidence
+            region_mask = labels == i
+            if region_mask.shape == var_map.shape:
+                region_var = var_map[region_mask]
+            else:
+                region_var = np.array([])
+
             if len(region_var) > 0:
                 region_mean = np.mean(region_var)
                 z_dist = abs(region_mean - mean_var) / max(std_var, 1e-6)
-                confidence = min(99, int((z_dist / max(sensitivity, 1e-6)) * 100))
+                confidence = min(99, max(10, int((z_dist / max(sensitivity, 1e-6)) * 100)))
             else:
                 confidence = 50
 
@@ -224,15 +219,16 @@ class EdgeInspector:
                 "Type": name,
                 "Area (px)": int(real_area),
                 "Confidence": f"{confidence}%",
-                "bbox_x": x, "bbox_y": y, "bbox_w": bw, "bbox_h": bh
+                "bbox_x": bx, "bbox_y": by, "bbox_w": bw, "bbox_h": bh,
             })
 
-            cv2.rectangle(result, (x, y), (x + bw, y + bh), color, 3)
-            cv2.putText(result, name, (x, y - 10),
+            cv2.rectangle(result, (bx, by), (bx + bw, by + bh), color, 3)
+            cv2.putText(result, name, (bx, max(by - 10, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Visualization maps
+        # Visualization outputs
         edge_viz = cv2.Canny(img_gray, 50, 150)
+        var_norm = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         anomaly_heatmap = cv2.applyColorMap(var_norm, cv2.COLORMAP_MAGMA)
 
         return original, edge_viz, anomaly_heatmap, result, defect_list

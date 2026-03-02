@@ -28,6 +28,7 @@ SEAM_SETTINGS = {
     "CROOKED_R2_THRESH": 0.85,  # Linear regression R² below this = crooked
     "PUCKER_VAR_SIGMA": 2.0,   # Laplacian variance Z-score for pucker detection
     "RUNOFF_EDGE_MARGIN": 0.10, # Fraction of image width to check for run-off
+    "BROKEN_GAP_MIN": 20,      # Projection gap >= this = Broken Stitch (else Skip)
 }
 
 # --- DEFECT TAXONOMY ---
@@ -64,7 +65,7 @@ DEFECT_TYPES = {
 # --- UNIFIED PROCESSOR ---
 UNIFIED_SETTINGS = {
     "DEFAULT_MODE": "full",       # "full", "structure_only", "seam_only"
-    "SEAM_DETECTION_THRESH": 0.3, # Projection peak ratio to detect seam presence
+    "SEAM_DETECTION_THRESH": 0.15, # Projection gradient threshold for seam pre-classifier
     "SUB_CLASSIFY": True,         # Enable sub-classification refinement
     # Sub-classification thresholds
     "OIL_STAIN_SOLIDITY_MIN": 0.85,    # High solidity = oil stain (round/smooth)

@@ -27,12 +27,6 @@ from inspectors.unified_processor import unified_processor
 GROUP_I_TYPES = {
     "Missing Thread", "Slub", "Oil Stain",
     "Hole", "Tear", "Snag",
-    # Legacy names (backward compat)
-    "Cut / Tear (Horiz)", "Cut / Tear (Vert)",
-    "Horizontal Tear/Thread", "Vertical Tear/Thread",
-    "Ragged Hole", "Structural Break", "Weave Irregularity",
-    "Oil / Water Stain", "Texture Defect", "Rough Weave",
-    "Texture Anomaly",
 }
 # Group II: Stitch Quality defects (seam-related)
 GROUP_II_TYPES = {
@@ -43,15 +37,9 @@ GROUP_II_TYPES = {
 STRUCTURAL_TYPES = {
     "Missing Thread", "Hole", "Tear", "Snag",
     "Skip Stitch", "Broken Stitch", "Run-off Stitch", "Crooked Stitch",
-    "Cut / Tear (Horiz)", "Cut / Tear (Vert)",
-    "Horizontal Tear/Thread", "Vertical Tear/Thread",
-    "Ragged Hole", "Structural Break", "Weave Irregularity",
 }
 SURFACE_TYPES = {
     "Slub", "Oil Stain", "Pucker",
-    "Oil / Water Stain", "Texture Defect", "Rough Weave",
-    "Texture Anomaly", "Wrinkle / Fold (Horiz)", "Wrinkle / Fold (Vert)",
-    "Deviation",
 }
 
 def classify_defect(defect_type: str) -> str:
