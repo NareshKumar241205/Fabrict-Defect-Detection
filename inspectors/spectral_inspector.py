@@ -1,26 +1,27 @@
 """
 Spectral Residual Inspector Module (Algorithm A)
 =================================================
-Uses Fourier Transform (FFT) to detect anomalies in repetitive textures.
+Uses Fourier Transform (FFT) **and** Discrete Wavelet Transform (DWT)
+to detect anomalies in repetitive textures.
 
-Algorithm (Spectral Residual Approach):
+Algorithm (Hybrid FFT + DWT Approach):
 1. Resize to processing resolution & apply CLAHE illumination correction.
-2. Transform image to Frequency Domain (FFT).
-3. Compute Log Amplitude Spectrum.
-4. Compute Spectral Residual (Log Spectrum − Average Spectrum).
-5. Inverse FFT to get Saliency Map.
-6. Threshold Saliency Map (Z-score) to find defects.
+2. FFT path: Spectral Residual Saliency (original pipeline).
+3. DWT path: Multi-level wavelet decomposition (PyWavelets) →
+   suppress periodic weave in detail coefficients → Inverse DWT
+   reconstructs a *defect-only* image with pixel-perfect boundaries.
+4. Fuse FFT saliency and DWT defect map (element-wise max).
+5. Sauvola local thresholding (replaces global Z-score) for
+   robustness against uneven lighting or shadows.
 
 Detects: Missing Threads, Slubs, Oil Stains.
-
-This method works because the repetitive background (weave) has a strong,
-predictable spectral signature. Subtracting the average spectrum removes this
-background, leaving only the "surprise" (defect) in the Saliency Map.
 """
 
 import cv2
 import numpy as np
+import pywt
 from typing import Tuple, List, Dict, Any, BinaryIO
+from skimage.filters import threshold_sauvola
 
 
 class SpectralInspector:
@@ -93,6 +94,51 @@ class SpectralInspector:
         return cv2.resize(saliency, (img_gray.shape[1], img_gray.shape[0]))
 
     # ──────────────────────────────────────────
+    # DWT defect map (Wavelet)
+    # ──────────────────────────────────────────
+    def _compute_dwt_defect_map(
+        self, img_gray: np.ndarray, wavelet: str = "db4", level: int = 3
+    ) -> np.ndarray:
+        """Decompose with DWT, suppress periodic weave, reconstruct defect-only image.
+
+        The repeating weave pattern concentrates energy in the approximation
+        coefficients and in regular, low-energy detail bands.  By soft-thresholding
+        the approximation to zero and keeping only the *anomalous* detail
+        coefficients, the inverse DWT produces an image where only defects
+        (slubs, missing threads, stains) remain, with pixel-perfect boundaries.
+        """
+        img_f = img_gray.astype(np.float64)
+
+        # Multi-level 2-D DWT
+        coeffs = pywt.wavedec2(img_f, wavelet, level=level)
+
+        # Zero out the approximation (low-frequency weave background)
+        coeffs[0] = np.zeros_like(coeffs[0])
+
+        # For each detail level, soft-threshold to suppress periodic structure
+        # but preserve anomalies (defects with unusually high energy)
+        for i in range(1, len(coeffs)):
+            details = list(coeffs[i])  # (cH, cV, cD)
+            for j in range(len(details)):
+                d = details[j]
+                # Universal threshold (VisuShrink)
+                sigma = np.median(np.abs(d)) / 0.6745
+                thresh = sigma * np.sqrt(2 * np.log(max(d.size, 2)))
+                # Keep only coefficients ABOVE the threshold (anomalies)
+                details[j] = pywt.threshold(d, thresh, mode="hard")
+            coeffs[i] = tuple(details)
+
+        # Inverse DWT → defect-only reconstruction
+        reconstructed = pywt.waverec2(coeffs, wavelet)
+        reconstructed = np.abs(reconstructed)
+
+        # Resize to match img_gray (DWT may pad slightly)
+        h, w = img_gray.shape
+        reconstructed = cv2.resize(reconstructed, (w, h))
+
+        return cv2.normalize(reconstructed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # ──────────────────────────────────────────
     # Main pipeline
     # ──────────────────────────────────────────
     def detect_defects(
@@ -111,16 +157,30 @@ class SpectralInspector:
         original, img_small, img_gray, scale = self._preprocess(img_buffer)
         result = original.copy()
 
-        # 1. Multi-Resolution Saliency (Image Pyramid)
+        # 1. Multi-Resolution FFT Saliency (Image Pyramid)
         fft_scales = [512, 256, 128]
         saliency_maps = [self._compute_saliency_map(img_gray, s) for s in fft_scales]
-        saliency_map = np.maximum.reduce(saliency_maps)
+        saliency_fft = np.maximum.reduce(saliency_maps)
 
-        # 2. Dynamic Z-score thresholding
+        # 1b. DWT defect map (wavelet) — pixel-perfect spatial localisation
+        dwt_map = self._compute_dwt_defect_map(img_gray, wavelet="db4", level=3)
+
+        # 1c. Fuse FFT saliency and DWT defect map (element-wise max)
+        saliency_map = np.maximum(saliency_fft, dwt_map)
+
+        # 2. Sauvola local adaptive thresholding (replaces global Z-score)
+        #    Window size inversely proportional to sensitivity
+        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
+        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
+        sauvola_thresh = threshold_sauvola(saliency_map, window_size=sauvola_win, k=0.2)
+        binary_map = np.zeros_like(saliency_map, dtype=np.uint8)
+        binary_map[saliency_map > sauvola_thresh] = 255
+
+        # Also maintain a global floor so noise in flat regions is ignored
         mean_sal = np.mean(saliency_map)
         std_sal = np.std(saliency_map)
-        thresh_val = mean_sal + sensitivity * std_sal
-        _, binary_map = cv2.threshold(saliency_map, thresh_val, 255, cv2.THRESH_BINARY)
+        global_floor = mean_sal + sensitivity * std_sal * 0.5
+        binary_map[saliency_map < global_floor] = 0
 
         # 2b. Morphological closing to reconnect fragmented detections
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))

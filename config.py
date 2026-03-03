@@ -20,6 +20,30 @@ GLCM_SETTINGS = {
     }
 }
 
+# --- MODULE A+: WAVELET (DWT) ---
+DWT_SETTINGS = {
+    "WAVELET": "db4",          # Daubechies-4 (good general-purpose wavelet for textiles)
+    "LEVEL": 3,                # Decomposition depth (3 = coarse + fine details)
+    "THRESHOLD_MODE": "hard",  # 'hard' preserves edges better than 'soft'
+}
+
+# --- MODULE A++: FRANGI (Vesselness / Thread) ---
+FRANGI_SETTINGS = {
+    "SIGMAS": [1, 2, 3, 4],    # Scale range — thread widths in pixels
+    "ALPHA": 0.5,              # Plate-like structure sensitivity
+    "BETA": 0.5,               # Blob-like structure sensitivity
+    "GAMMA": 15,               # Structureness threshold
+    "BLACK_RIDGES": False,     # True for dark threads on light fabric
+}
+
+# --- MODULE A+++: REFERENCE COMPARE (Golden Image + SSIM) ---
+REFERENCE_SETTINGS = {
+    "MIN_ORB_MATCHES": 10,     # Minimum good ORB feature matches for homography
+    "SSIM_WIN_SIZE": 11,       # SSIM local window size (odd)
+    "SAUVOLA_WINDOW": 51,      # Sauvola thresholding window for SSIM map
+    "SAUVOLA_K": 0.2,          # Sauvola sensitivity parameter
+}
+
 # --- MODULE B: SEAM (Stitch) ---
 SEAM_SETTINGS = {
     "GAP_TOLERANCE": 10,       # Max pixels allowed between stitches
@@ -73,4 +97,7 @@ UNIFIED_SETTINGS = {
     "SNAG_AREA_MAX": 800,              # Small edge defect = snag
     "HOLE_AREA_MIN": 1000,             # Large edge defect = hole
     "BROKEN_GAP_MIN": 20,             # Large gap in projection = broken stitch
+    # Sauvola local thresholding (global default for all inspectors)
+    "SAUVOLA_WINDOW": 51,              # Rolling window size for local mean/std
+    "SAUVOLA_K": 0.2,                  # Sauvola k parameter (lower = more sensitive)
 }

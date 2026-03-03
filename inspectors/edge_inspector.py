@@ -2,21 +2,27 @@
 Edge / Structural Inspector Module (Algorithm C)
 =================================================
 Detects structural/geometric defects like holes, tears, and snags using
-classical edge detection and line-spacing regularity analysis.
+classical edge detection, line-spacing regularity, and **Frangi vesselness**
+analysis for thread-level inspection.
 
 Algorithm:
 1. CLAHE illumination correction.
 2. Canny edge detection (auto-threshold via Otsu).
 3. Hough Line Transform → dominant weave-line spacing analysis.
 4. Per-patch Laplacian variance → detects ruptures and structural changes.
-5. Combined anomaly mask → connected-component extraction.
+5. **Frangi filter** (Hessian eigenvalue analysis) → isolates individual
+   threads / continuous line structures to flag loose snags or missing threads.
+6. Combined anomaly mask → **Sauvola local thresholding** (replaces global
+   Z-score for immunity to lighting gradients).
+7. Connected-component extraction.
 
-Detects: Holes, Tears, Snags.
+Detects: Holes, Tears, Snags, Missing Threads.
 """
 
 import cv2
 import numpy as np
 from typing import Tuple, List, Dict, Any, BinaryIO
+from skimage.filters import frangi, threshold_sauvola
 
 
 class EdgeInspector:
@@ -128,6 +134,61 @@ class EdgeInspector:
         return anomaly_mask
 
     # ──────────────────────────────────────────
+    # Frangi vesselness filter (thread detection)
+    # ──────────────────────────────────────────
+    def _compute_frangi_anomaly(
+        self, img_gray: np.ndarray, sensitivity: float
+    ) -> np.ndarray:
+        """Use the Frangi (vesselness) filter to detect thread-like structures.
+
+        The Frangi filter analyses eigenvalues of the Hessian matrix to
+        enhance continuous, tube-like / line-like structures.  It was
+        originally developed for blood-vessel segmentation in medical
+        imaging but is mathematically ideal for isolating individual
+        threads in a fabric weave.
+
+        We compute the vesselness response, invert it (so *missing* or
+        *disrupted* threads become bright), and return an anomaly mask.
+        """
+        img_f = img_gray.astype(np.float64) / 255.0
+
+        # Frangi across multiple scales to capture different thread widths
+        sigmas = range(1, 5)
+        vesselness = frangi(
+            img_f,
+            sigmas=sigmas,
+            alpha=0.5,
+            beta=0.5,
+            gamma=15,
+            black_ridges=False,
+        )
+
+        # Normalize to [0, 255]
+        vesselness_norm = cv2.normalize(
+            vesselness, None, 0, 255, cv2.NORM_MINMAX
+        ).astype(np.uint8)
+
+        # In a healthy weave, vesselness is uniformly high along threads.
+        # Regions where vesselness *drops* indicate missing/broken threads.
+        # Invert so anomalies (low vesselness) become bright.
+        inverted = 255 - vesselness_norm
+
+        # Sauvola local thresholding to find locally anomalous regions
+        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
+        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
+        sauvola_thresh = threshold_sauvola(inverted, window_size=sauvola_win, k=0.15)
+        frangi_mask = np.zeros_like(inverted, dtype=np.uint8)
+        frangi_mask[inverted > sauvola_thresh] = 255
+
+        # Remove noise: only keep regions where vesselness truly broke down
+        mean_v = np.mean(inverted)
+        std_v = np.std(inverted)
+        global_floor = mean_v + sensitivity * std_v * 0.4
+        frangi_mask[inverted < global_floor] = 0
+
+        return frangi_mask
+
+    # ──────────────────────────────────────────
     # Main pipeline
     # ──────────────────────────────────────────
     def detect_defects(
@@ -145,29 +206,38 @@ class EdgeInspector:
         mean_var = np.mean(var_map)
         std_var = np.std(var_map)
 
-        # ── FIX: Z-score thresholding on the RAW variance map ──
-        # Build a binary mask directly from statistical outliers of the
-        # raw float variance, avoiding the old normalization mismatch.
+        # ── Sauvola local adaptive thresholding on the Laplacian variance ──
+        # Normalise var_map to [0, 255] for Sauvola
+        var_norm_f = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
+        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
+        sauvola_thresh = threshold_sauvola(var_norm_f, window_size=sauvola_win, k=0.2)
+        laplacian_mask = np.zeros((h, w), dtype=np.uint8)
+        laplacian_mask[var_norm_f > sauvola_thresh] = 255
+
+        # Global floor so flat regions are not falsely flagged
         if std_var > 1e-6:
             z_map = np.abs(var_map - mean_var) / std_var
         else:
             z_map = np.zeros_like(var_map)
-
-        laplacian_mask = np.zeros((h, w), dtype=np.uint8)
-        laplacian_mask[z_map > sensitivity] = 255
+        laplacian_mask[z_map < sensitivity * 0.5] = 0
 
         # 2. Line regularity analysis
         line_mask = self._analyze_line_regularity(img_gray)
 
-        # 3. Combine
-        combined_mask = cv2.bitwise_or(laplacian_mask, line_mask)
+        # 3. Frangi vesselness anomaly (thread-level structural defects)
+        frangi_mask = self._compute_frangi_anomaly(img_gray, sensitivity)
 
-        # 4. Morphological cleanup
+        # 4. Combine all three masks
+        combined_mask = cv2.bitwise_or(laplacian_mask, line_mask)
+        combined_mask = cv2.bitwise_or(combined_mask, frangi_mask)
+
+        # 5. Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=2)
 
-        # 5. Extract defects
+        # 6. Extract defects
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined_mask, connectivity=8)
 
         defect_list: List[Dict[str, Any]] = []

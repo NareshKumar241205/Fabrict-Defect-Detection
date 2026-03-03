@@ -676,6 +676,13 @@ with tab_inspect:
                                             help="Enable this if uneven lighting is causing false positive defects",
                                             key="shadow_toggle")
 
+        with st.container(border=True):
+            st.markdown("**🖼️ Reference Compare (Golden Image)**")
+            st.caption("Upload a known-good sample for SSIM-based comparison")
+            ref_file = st.file_uploader("Golden image", type=["jpg", "png", "bmp"], key="ref_upload")
+            if ref_file:
+                st.image(ref_file, caption="Golden Reference", width=150)
+
     # ── PROCESS ──
     if img_file is not None:
         orig_img, validation_error = validate_image(img_file)
@@ -690,7 +697,8 @@ with tab_inspect:
                 buf = clone_buffer(img_file)
                 
                 progress.progress(0.2, text="🧠  Routing to detection engines…")
-                result = unified_processor.process(buf, sensitivity=sensitivity, mode="full", remove_shadows=remove_shadows_ui)
+                ref_buf = clone_buffer(ref_file) if ref_file else None
+                result = unified_processor.process(buf, sensitivity=sensitivity, mode="full", remove_shadows=remove_shadows_ui, ref_buffer=ref_buf)
                 
                 progress.progress(0.9, text="📊  Compiling results…")
                 all_defects = result["defects"]
@@ -780,9 +788,11 @@ with tab_inspect:
                 map_items = list(viz_maps.items())
                 map_labels = {
                     "entropy": "🧵 Entropy Heatmap (Texture)",
-                    "saliency": "📡 Saliency Map (Spectral)",
-                    "anomaly_heatmap": "📐 Anomaly Heatmap (Edge)",
+                    "saliency": "📡 Saliency Map (Spectral+DWT)",
+                    "anomaly_heatmap": "📐 Anomaly Heatmap (Edge+Frangi)",
                     "seam_output": "🪡 Seam Detection Output",
+                    "ssim_heatmap": "🖼️ SSIM Deviation Map (Reference)",
+                    "reference_result": "🔍 Reference Compare Result",
                 }
                 for idx, (key, viz_img) in enumerate(map_items):
                     col_idx = idx % len(map_cols)
