@@ -395,7 +395,7 @@ class UnifiedProcessor:
             all_viz_maps.update(ref_viz)
 
         # Internal NMS (deduplication across engines)
-        all_defects = self._nms(all_defects, iou_thresh=0.5)
+        all_defects = self._nms(all_defects, iou_thresh=0.3)
 
         # Re-number IDs
         for i, d in enumerate(all_defects, 1):

@@ -154,6 +154,12 @@ class SpectralInspector:
         Returns:
             (original_bgr, result_bgr, saliency_heatmap, defect_list)
         """
+        from config import UNIFIED_SETTINGS
+
+        use_sauvola = UNIFIED_SETTINGS.get("USE_SAUVOLA_SPECTRAL", False)
+        use_dwt = UNIFIED_SETTINGS.get("USE_DWT", True)
+        sauvola_window = UNIFIED_SETTINGS.get("SAUVOLA_WINDOW", 151)
+
         original, img_small, img_gray, scale = self._preprocess(img_buffer)
         result = original.copy()
 
@@ -162,23 +168,29 @@ class SpectralInspector:
         saliency_maps = [self._compute_saliency_map(img_gray, s) for s in fft_scales]
         saliency_fft = np.maximum.reduce(saliency_maps)
 
-        # 1b. DWT defect map (wavelet) — pixel-perfect spatial localisation
-        dwt_map = self._compute_dwt_defect_map(img_gray, wavelet="db4", level=3)
+        # 1b. DWT defect map (wavelet) — optional
+        if use_dwt:
+            dwt_map = self._compute_dwt_defect_map(img_gray, wavelet="db4", level=3)
+            saliency_map = np.maximum(saliency_fft, dwt_map)
+        else:
+            saliency_map = saliency_fft
 
-        # 1c. Fuse FFT saliency and DWT defect map (element-wise max)
-        saliency_map = np.maximum(saliency_fft, dwt_map)
-
-        # 2. Sauvola local adaptive thresholding (replaces global Z-score)
-        #    Window size inversely proportional to sensitivity
-        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
-        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
-        sauvola_thresh = threshold_sauvola(saliency_map, window_size=sauvola_win, k=0.2)
-        binary_map = np.zeros_like(saliency_map, dtype=np.uint8)
-        binary_map[saliency_map > sauvola_thresh] = 255
-
-        # Also maintain a global floor so noise in flat regions is ignored
+        # 2. Global z-score thresholding for FFT saliency
         mean_sal = np.mean(saliency_map)
         std_sal = np.std(saliency_map)
+
+        if use_sauvola:
+            # Sauvola local adaptive thresholding (optional fallback)
+            sauvola_thresh = threshold_sauvola(saliency_map, window_size=sauvola_window, k=0.2)
+            binary_map = np.zeros_like(saliency_map, dtype=np.uint8)
+            binary_map[saliency_map > sauvola_thresh] = 255
+        else:
+            # Global z-score thresholding
+            binary_map = np.zeros_like(saliency_map, dtype=np.uint8)
+            saliency_z = (saliency_map - mean_sal) / max(std_sal, 1e-6)
+            binary_map[saliency_z > sensitivity] = 255
+
+        # Maintain a global floor so noise in flat regions is ignored
         global_floor = mean_sal + sensitivity * std_sal * 0.5
         binary_map[saliency_map < global_floor] = 0
 

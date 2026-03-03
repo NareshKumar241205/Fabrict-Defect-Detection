@@ -98,6 +98,14 @@ UNIFIED_SETTINGS = {
     "HOLE_AREA_MIN": 1000,             # Large edge defect = hole
     "BROKEN_GAP_MIN": 20,             # Large gap in projection = broken stitch
     # Sauvola local thresholding (global default for all inspectors)
-    "SAUVOLA_WINDOW": 51,              # Rolling window size for local mean/std
+    "SAUVOLA_WINDOW": 151,             # Rolling window size for local mean/std (larger to guard against stains)
     "SAUVOLA_K": 0.2,                  # Sauvola k parameter (lower = more sensitive)
+    # Feature toggles for reliable detection
+    "USE_SAUVOLA_TEXTURE": False,      # Use Sauvola in texture inspector (default False for global z-score)
+    "USE_SAUVOLA_SPECTRAL": False,     # Use Sauvola in spectral inspector (default False)
+    "USE_DWT": True,                   # Enable DWT in spectral inspector
+    "USE_FRANGI": False,               # Enable Frangi in edge inspector (default False for thread-only mode)
+    "GLCM_WEIGHT": 1.0,                # Weight for GLCM in fusion (primary for stains/holes)
+    "SPECTRAL_WEIGHT": 0.8,            # Weight for spectral maps
+    "EDGE_WEIGHT": 0.5,                # Weight for edge maps
 }

@@ -198,6 +198,10 @@ class EdgeInspector:
         min_area: int = 800,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """Returns (original, edge_viz, anomaly_heatmap, annotated, defects)."""
+        from config import UNIFIED_SETTINGS
+
+        use_frangi = UNIFIED_SETTINGS.get("USE_FRANGI", False)
+
         original, img_small, img_gray, scale = self._preprocess(img_buffer)
         h, w = img_gray.shape
 
@@ -206,14 +210,11 @@ class EdgeInspector:
         mean_var = np.mean(var_map)
         std_var = np.std(var_map)
 
-        # ── Sauvola local adaptive thresholding on the Laplacian variance ──
-        # Normalise var_map to [0, 255] for Sauvola
+        # ── Global z-score thresholding on the Laplacian variance ──
         var_norm_f = cv2.normalize(var_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
-        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
-        sauvola_thresh = threshold_sauvola(var_norm_f, window_size=sauvola_win, k=0.2)
+        var_z = (var_map - mean_var) / max(std_var, 1e-6)
         laplacian_mask = np.zeros((h, w), dtype=np.uint8)
-        laplacian_mask[var_norm_f > sauvola_thresh] = 255
+        laplacian_mask[var_z > sensitivity] = 255
 
         # Global floor so flat regions are not falsely flagged
         if std_var > 1e-6:
@@ -225,12 +226,17 @@ class EdgeInspector:
         # 2. Line regularity analysis
         line_mask = self._analyze_line_regularity(img_gray)
 
-        # 3. Frangi vesselness anomaly (thread-level structural defects)
-        frangi_mask = self._compute_frangi_anomaly(img_gray, sensitivity)
+        # 3. Frangi vesselness anomaly (thread-level structural defects) — optional
+        if use_frangi:
+            frangi_mask = self._compute_frangi_anomaly(img_gray, sensitivity)
+        else:
+            frangi_mask = np.zeros((h, w), dtype=np.uint8)
 
-        # 4. Combine all three masks
+        # 4. Combine Laplacian and line masks (primary for stains/holes)
         combined_mask = cv2.bitwise_or(laplacian_mask, line_mask)
-        combined_mask = cv2.bitwise_or(combined_mask, frangi_mask)
+        # Optionally OR with Frangi if enabled
+        if use_frangi:
+            combined_mask = cv2.bitwise_or(combined_mask, frangi_mask)
 
         # 5. Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
