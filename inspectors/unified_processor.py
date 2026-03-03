@@ -26,6 +26,7 @@ from inspectors.spectral_inspector import SpectralInspector
 from inspectors.edge_inspector import EdgeInspector
 from inspectors.texture_inspector import TextureInspector
 from inspectors.seam_inspector import SeamInspector
+from inspectors.reference_inspector import ReferenceInspector
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class UnifiedProcessor:
         self._edge = EdgeInspector()
         self._texture = TextureInspector()
         self._seam = SeamInspector()
+        self._reference = ReferenceInspector()
         self._cfg = UNIFIED_SETTINGS
         self._seam_thresh = self._cfg.get("SEAM_DETECTION_THRESH", 0.3)
 
@@ -294,6 +296,40 @@ class UnifiedProcessor:
         return defects, viz_maps
 
     # ──────────────────────────────────────────
+    # Reference-Based Inspection (Golden Image + SSIM)
+    # ──────────────────────────────────────────
+    def _route_reference(
+        self, img_buffer: BinaryIO, ref_buffer: BinaryIO, sensitivity: float
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Reference Compare — align test to golden image, SSIM diff."""
+        defects: List[Dict[str, Any]] = []
+        viz_maps: Dict[str, Any] = {}
+
+        try:
+            img_buffer.seek(0)
+            buf_test = BytesIO(img_buffer.read())
+            img_buffer.seek(0)
+
+            ref_buffer.seek(0)
+            buf_ref = BytesIO(ref_buffer.read())
+            ref_buffer.seek(0)
+
+            _, result_img, ssim_heatmap, ref_defs = self._reference.detect_defects(
+                buf_test, buf_ref, sensitivity=sensitivity
+            )
+            viz_maps["ssim_heatmap"] = ssim_heatmap
+            viz_maps["reference_result"] = result_img
+            for d in ref_defs:
+                d["Engine"] = "Reference (SSIM)"
+                d["Group"] = "Fabric Structure"
+                d["Inspector"] = "Reference"
+            defects.extend(ref_defs)
+        except Exception as e:
+            logger.warning("Reference engine failed: %s", e)
+
+        return defects, viz_maps
+
+    # ──────────────────────────────────────────
     # Main API
     # ──────────────────────────────────────────
     def process(
@@ -302,8 +338,12 @@ class UnifiedProcessor:
         sensitivity: float = 2.5,
         mode: str = "full",
         remove_shadows: bool = False,
+        ref_buffer: BinaryIO = None,
     ) -> Dict[str, Any]:
         """Run the full Unified Pipeline.
+
+        Args:
+            ref_buffer: Optional golden-image buffer for Reference Compare mode.
 
         Returns dict with keys: defects, group_i_defects, group_ii_defects,
         viz_maps, routing_info, summary.
@@ -344,6 +384,15 @@ class UnifiedProcessor:
             g2_defects, g2_viz = self._route_group_ii(pipeline_buffer, sensitivity)
             all_defects.extend(g2_defects)
             all_viz_maps.update(g2_viz)
+
+        # Reference Compare (SSIM Golden Image) if reference provided
+        if ref_buffer is not None:
+            engines_used.append("Reference Compare (SSIM)")
+            ref_defects, ref_viz = self._route_reference(
+                pipeline_buffer, ref_buffer, sensitivity
+            )
+            all_defects.extend(ref_defects)
+            all_viz_maps.update(ref_viz)
 
         # Internal NMS (deduplication across engines)
         all_defects = self._nms(all_defects, iou_thresh=0.5)

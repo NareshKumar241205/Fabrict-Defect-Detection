@@ -1,25 +1,31 @@
 """
 Texture & GLCM Inspector Module (Algorithm B)
 ===============================================
-Detects texture anomalies using LBP, Entropy, and Gabor filter banks.
+Detects texture anomalies using LBP, Entropy, Gabor filter banks,
+and **actual GLCM (Gray Level Co-occurrence Matrix)** Haralick features.
 
-Detects: Rough Weave / complex stains / general texture defects.
-Sub-classification into the 10-type taxonomy (Missing Thread, Slub,
-Oil Stain, etc.) is handled by the Unified Processor's sub-classifiers.
+Detects: Rough Weave / complex stains / general texture defects /
+         broken weave patterns (via GLCM Correlation drop).
 
 Algorithm:
 1. Multi-scale LBP → Entropy analysis for local randomness spikes.
 2. Gabor filter bank (6 orientations × 3 frequencies) for directional defects.
-3. Fuse both anomaly maps (max), Z-score threshold, connected-component extraction.
-4. Shape metrics (solidity, aspect ratio) stored for downstream sub-classification.
+3. **GLCM per-patch analysis** — Contrast, Correlation, Homogeneity.
+   Monitoring the Correlation metric mathematically proves when a weave
+   pattern is broken, giving high precision for structural damage.
+4. Fuse all anomaly maps (max), **Sauvola local adaptive thresholding**
+   (replaces global Z-score — immune to uneven lighting), connected-
+   component extraction.
+5. Shape metrics (solidity, aspect ratio) stored for downstream sub-classification.
 """
 
 import cv2
 import numpy as np
 import logging
 from typing import Tuple, List, Dict, Any, BinaryIO
-from skimage.feature import local_binary_pattern
+from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
 from skimage.filters.rank import entropy
+from skimage.filters import threshold_sauvola
 from skimage.morphology import disk
 
 logger = logging.getLogger(__name__)
@@ -93,6 +99,67 @@ class TextureInspector:
         gabor_fused = np.maximum.reduce(responses)
         return cv2.normalize(gabor_fused, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
+    def compute_glcm_map(self, img_gray: np.ndarray, patch_size: int = 48, step: int = 24) -> np.ndarray:
+        """Compute per-patch GLCM features → anomaly map.
+
+        For each patch, compute the Gray Level Co-occurrence Matrix and extract:
+        - Contrast:    high in defective regions (edges, holes)
+        - Correlation:  drops sharply when the periodic weave is broken
+        - Homogeneity:  abnormally high for smooth stains
+
+        Returns a normalized anomaly map [0..255] where high values = anomalous.
+        """
+        from config import GLCM_SETTINGS
+
+        distances = GLCM_SETTINGS.get("DISTANCES", [1])
+        angles = GLCM_SETTINGS.get("ANGLES", [0, np.pi / 2])
+        thresholds = GLCM_SETTINGS.get("THRESHOLDS", {})
+
+        contrast_max = thresholds.get("contrast_max", 250)
+        correlation_min = thresholds.get("correlation_min", 0.80)
+        homogeneity_max = thresholds.get("homogeneity_max", 0.98)
+
+        h, w = img_gray.shape
+        anomaly_map = np.zeros((h, w), dtype=np.float32)
+        count_map = np.zeros((h, w), dtype=np.float32)
+
+        # Quantize to 64 levels for faster GLCM
+        img_q = (img_gray // 4).astype(np.uint8)
+
+        for y in range(0, h - patch_size, step):
+            for x in range(0, w - patch_size, step):
+                patch = img_q[y : y + patch_size, x : x + patch_size]
+
+                glcm = graycomatrix(
+                    patch,
+                    distances=distances,
+                    angles=angles,
+                    levels=64,
+                    symmetric=True,
+                    normed=True,
+                )
+
+                contrast = float(np.mean(graycoprops(glcm, "contrast")))
+                correlation = float(np.mean(graycoprops(glcm, "correlation")))
+                homogeneity = float(np.mean(graycoprops(glcm, "homogeneity")))
+
+                # Compute a combined anomaly score for this patch
+                score = 0.0
+                if contrast > contrast_max:
+                    score += min(1.0, contrast / contrast_max - 1.0)
+                if correlation < correlation_min:
+                    score += min(1.0, 1.0 - correlation / correlation_min)
+                if homogeneity > homogeneity_max:
+                    score += min(1.0, homogeneity / homogeneity_max - 1.0)
+
+                anomaly_map[y : y + patch_size, x : x + patch_size] += score
+                count_map[y : y + patch_size, x : x + patch_size] += 1.0
+
+        count_map[count_map == 0] = 1.0
+        anomaly_map = anomaly_map / count_map
+
+        return cv2.normalize(anomaly_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
     # ──────────────────────────────────────────
     # Main pipeline
     # ──────────────────────────────────────────
@@ -122,16 +189,35 @@ class TextureInspector:
         gabor_map = self.compute_gabor_map(img_gray)
         final_entropy_map = np.maximum(final_entropy_map, gabor_map)
 
-        # Z-score anomaly detection
+        # GLCM Haralick features — weave pattern structural analysis
+        glcm_map = self.compute_glcm_map(img_gray)
+        final_entropy_map = np.maximum(final_entropy_map, glcm_map)
+
+        # Sauvola local adaptive thresholding (replaces global Z-score)
+        # Calculates mean and std for rolling windows across the heatmap,
+        # making anomaly detection immune to uneven lighting or shadows.
         mean_ent = np.mean(final_entropy_map)
         std_ent = np.std(final_entropy_map)
 
-        lower_bound = mean_ent - sensitivity * std_ent
-        upper_bound = mean_ent + sensitivity * std_ent
+        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
+        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
+        sauvola_thresh = threshold_sauvola(final_entropy_map, window_size=sauvola_win, k=0.2)
 
+        # Regions above Sauvola threshold OR below global lower bound
+        mask_high = np.zeros_like(final_entropy_map, dtype=np.uint8)
+        mask_high[final_entropy_map > sauvola_thresh] = 255
+
+        # Also flag abnormally LOW texture (smooth stains, holes)
+        lower_bound = mean_ent - sensitivity * std_ent
         mask_low = cv2.inRange(final_entropy_map, 0, int(max(0, lower_bound)))
-        mask_high = cv2.inRange(final_entropy_map, int(min(255, upper_bound)), 255)
+
         mask_combined = cv2.bitwise_or(mask_low, mask_high)
+
+        # Global floor: ignore if not significantly deviant
+        global_floor_high = mean_ent + sensitivity * std_ent * 0.5
+        global_floor_low = mean_ent - sensitivity * std_ent * 0.5
+        trivial = (final_entropy_map > global_floor_low) & (final_entropy_map < global_floor_high)
+        mask_combined[trivial] = 0
 
         # Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
