@@ -182,8 +182,11 @@ class SpectralInspector:
         global_floor = mean_sal + sensitivity * std_sal * 0.5
         binary_map[saliency_map < global_floor] = 0
 
-        # 2b. Morphological closing to reconnect fragmented detections
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        # 2b. Morphological ops: open first to kill isolated noise, then small close
+        # to reconnect genuinely fragmented detections without merging distant blobs.
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_OPEN, kernel_open)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_CLOSE, kernel_close)
 
         # 3. Defect extraction
@@ -195,7 +198,7 @@ class SpectralInspector:
         defect_id = 0
         proc_h, proc_w = img_gray.shape[:2]
         img_total_area = proc_h * proc_w
-        min_area = max(200, int(img_total_area * 0.002))
+        min_area = max(300, int(img_total_area * 0.004))
 
         for contour in contours:
             area = cv2.contourArea(contour)

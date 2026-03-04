@@ -201,17 +201,23 @@ class TextureInspector:
 
         sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
         sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
-        sauvola_thresh = threshold_sauvola(final_entropy_map, window_size=sauvola_win, k=0.2)
+        # k=0.3 raises the local threshold, reducing false positives on flat regions
+        sauvola_thresh = threshold_sauvola(final_entropy_map, window_size=sauvola_win, k=0.3)
 
-        # Regions above Sauvola threshold OR below global lower bound
+        # Only flag regions ABOVE the Sauvola threshold (anomalously HIGH texture).
+        # mask_low (zero-entropy regions) is intentionally removed because it flags
+        # large uniform fabric patches that are clean — GLCM already captures smooth
+        # stains via the homogeneity channel.
         mask_high = np.zeros_like(final_entropy_map, dtype=np.uint8)
         mask_high[final_entropy_map > sauvola_thresh] = 255
 
-        # Also flag abnormally LOW texture (smooth stains, holes)
-        lower_bound = mean_ent - sensitivity * std_ent
-        mask_low = cv2.inRange(final_entropy_map, 0, int(max(0, lower_bound)))
+        # GLCM structural guard: require that flagged pixels also show a GLCM
+        # anomaly (glcm_map > 0 after normalisation means non-zero anomaly score).
+        # This prevents LBP entropy noise from creating boxes on clean fabric.
+        glcm_evidence = (glcm_map > 10).astype(np.uint8) * 255
+        mask_high = cv2.bitwise_and(mask_high, glcm_evidence)
 
-        mask_combined = cv2.bitwise_or(mask_low, mask_high)
+        mask_combined = mask_high
 
         # Global floor: ignore if not significantly deviant
         global_floor_high = mean_ent + sensitivity * std_ent * 0.5

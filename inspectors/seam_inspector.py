@@ -236,10 +236,13 @@ class SeamInspector:
 
         if r_squared < self.crooked_r2_thresh:
             max_dev = float(np.max(np.abs(cy - y_pred)))
+            # Clip x-range to the actual stitch extent, not the full image width
+            x_start = int(np.min(cx))
+            x_end = int(np.max(cx))
             defects.append({
-                "x": 0,
+                "x": x_start,
                 "y": max(0, int(np.min(cy) - 20)),
-                "w": w,
+                "w": max(1, x_end - x_start),
                 "h": min(h, int(np.max(cy) - np.min(cy) + 40)),
                 "type": "Crooked Stitch",
                 "score": int((1.0 - r_squared) * 100),

@@ -183,7 +183,8 @@ class EdgeInspector:
         # Remove noise: only keep regions where vesselness truly broke down
         mean_v = np.mean(inverted)
         std_v = np.std(inverted)
-        global_floor = mean_v + sensitivity * std_v * 0.4
+        # Raise the floor multiplier: 0.6 instead of 0.4 to require stronger anomaly signal
+        global_floor = mean_v + sensitivity * std_v * 0.6
         frangi_mask[inverted < global_floor] = 0
 
         return frangi_mask
@@ -228,11 +229,17 @@ class EdgeInspector:
         # 3. Frangi vesselness anomaly (thread-level structural defects)
         frangi_mask = self._compute_frangi_anomaly(img_gray, sensitivity)
 
-        # 4. Combine all three masks
+        # 4. Combine masks:
+        #   - Laplacian OR line_mask: the primary structural signals
+        #   - Frangi only where Laplacian ALSO fired (prevents uniform fabric false alarms)
         combined_mask = cv2.bitwise_or(laplacian_mask, line_mask)
-        combined_mask = cv2.bitwise_or(combined_mask, frangi_mask)
+        frangi_confirmed = cv2.bitwise_and(frangi_mask, laplacian_mask)
+        combined_mask = cv2.bitwise_or(combined_mask, frangi_confirmed)
 
-        # 5. Morphological cleanup
+        # 5. Morphological cleanup: open first to remove isolated speckles,
+        #    then close to reconnect legitimate fragmented detections.
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=2)
