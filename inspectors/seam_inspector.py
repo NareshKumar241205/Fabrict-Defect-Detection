@@ -230,25 +230,33 @@ class SeamInspector:
         b = (sum_y - m * sum_x) / n
 
         y_pred = m * cx + b
-        ss_res = np.sum((cy - y_pred) ** 2)
-        ss_tot = np.sum((cy - np.mean(cy)) ** 2)
-        r_squared = 1.0 - ss_res / max(ss_tot, 1e-10)
-
-        if r_squared < self.crooked_r2_thresh:
-            max_dev = float(np.max(np.abs(cy - y_pred)))
+        
+        # --- NEW LOGIC: Use Deviation instead of R-squared ---
+        # Calculate how far off the worst pixel is, and the average error
+        max_dev = float(np.max(np.abs(cy - y_pred)))
+        mse = np.sum((cy - y_pred) ** 2) / n
+        
+        # Flag as crooked if the stitch deviates by more than 8 pixels 
+        # from a straight line, or if the average error is high.
+        if max_dev > 8.0 or mse > 5.0:
+            x_start = int(np.min(cx))
+            x_end = int(np.max(cx))
+            
+            # Map deviation to a 10-99% confidence score
+            score = min(99, int((max_dev / 8.0) * 40)) 
+            
             defects.append({
-                "x": 0,
+                "x": x_start,
                 "y": max(0, int(np.min(cy) - 20)),
-                "w": w,
+                "w": max(1, x_end - x_start),
                 "h": min(h, int(np.max(cy) - np.min(cy) + 40)),
                 "type": "Crooked Stitch",
-                "score": int((1.0 - r_squared) * 100),
-                "r_squared": round(r_squared, 4),
+                "score": score,
                 "max_deviation_px": round(max_dev, 1),
+                "mse": round(mse, 2)
             })
 
         return defects
-
     # ──────────────────────────────────────────
     # Engine F: Laplacian Variance (Pucker)
     # ──────────────────────────────────────────

@@ -23,10 +23,11 @@ import cv2
 import numpy as np
 import logging
 from typing import Tuple, List, Dict, Any, BinaryIO
-from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
+from skimage.feature import local_binary_pattern
 from skimage.filters.rank import entropy
 from skimage.filters import threshold_sauvola
 from skimage.morphology import disk
+from skimage.feature.texture import graycomatrix, graycoprops
 
 logger = logging.getLogger(__name__)
 
