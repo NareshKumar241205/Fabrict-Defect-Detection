@@ -23,10 +23,11 @@ import cv2
 import numpy as np
 import logging
 from typing import Tuple, List, Dict, Any, BinaryIO
-from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
+from skimage.feature import local_binary_pattern
 from skimage.filters.rank import entropy
 from skimage.filters import threshold_sauvola
 from skimage.morphology import disk
+from skimage.feature.texture import graycomatrix, graycoprops
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,11 @@ class TextureInspector:
         min_area: int = 200,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """Returns (original, lbp_map, fused_entropy_map, annotated_result, defects)."""
+        from config import UNIFIED_SETTINGS
+
+        use_sauvola = UNIFIED_SETTINGS.get("USE_SAUVOLA_TEXTURE", False)
+        sauvola_window = UNIFIED_SETTINGS.get("SAUVOLA_WINDOW", 151)
+
         orig_full, img_small, img_gray, scale_factor = self._preprocess(img_buffer)
         h, w = img_gray.shape
 
@@ -187,47 +193,47 @@ class TextureInspector:
 
         # Gabor filter bank — normalize BEFORE fusion so scales match
         gabor_map = self.compute_gabor_map(img_gray)
-        final_entropy_map = np.maximum(final_entropy_map, gabor_map)
 
-        # GLCM Haralick features — weave pattern structural analysis
+        # GLCM Haralick features — primary for stains/holes (isolated)
         glcm_map = self.compute_glcm_map(img_gray)
-        final_entropy_map = np.maximum(final_entropy_map, glcm_map)
 
-        # Sauvola local adaptive thresholding (replaces global Z-score)
-        # Calculates mean and std for rolling windows across the heatmap,
-        # making anomaly detection immune to uneven lighting or shadows.
-        mean_ent = np.mean(final_entropy_map)
-        std_ent = np.std(final_entropy_map)
+        # Conservative fusion: GLCM as primary, add Gabor/entropy for threads
+        final_anomaly_map = glcm_map.copy()
+        final_anomaly_map = np.maximum(final_anomaly_map, gabor_map)
+        final_anomaly_map = np.maximum(final_anomaly_map, final_entropy_map)
 
-        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
-        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
-        # k=0.3 raises the local threshold, reducing false positives on flat regions
-        sauvola_thresh = threshold_sauvola(final_entropy_map, window_size=sauvola_win, k=0.3)
+        # Global z-score thresholding for the fused anomaly map
+        mean_ent = np.mean(final_anomaly_map)
+        std_ent = np.std(final_anomaly_map)
 
-        # Only flag regions ABOVE the Sauvola threshold (anomalously HIGH texture).
-        # mask_low (zero-entropy regions) is intentionally removed because it flags
-        # large uniform fabric patches that are clean — GLCM already captures smooth
-        # stains via the homogeneity channel.
-        mask_high = np.zeros_like(final_entropy_map, dtype=np.uint8)
-        mask_high[final_entropy_map > sauvola_thresh] = 255
+        # Use global z-score or Sauvola
+        if use_sauvola:
+            # Sauvola local adaptive thresholding (fallback for severe illumination)
+            sauvola_thresh = threshold_sauvola(final_anomaly_map, window_size=sauvola_window, k=0.2)
+            combined_binary = np.zeros_like(final_anomaly_map, dtype=np.uint8)
+            combined_binary[final_anomaly_map > sauvola_thresh] = 255
+        else:
+            # Global z-score gating
+            combined_binary = np.zeros_like(final_anomaly_map, dtype=np.uint8)
+            anomaly_z = (final_anomaly_map - mean_ent) / max(std_ent, 1e-6)
+            combined_binary[anomaly_z > sensitivity] = 255
 
-        # GLCM structural guard: require that flagged pixels also show a GLCM
-        # anomaly (glcm_map > 0 after normalisation means non-zero anomaly score).
-        # This prevents LBP entropy noise from creating boxes on clean fabric.
-        glcm_evidence = (glcm_map > 10).astype(np.uint8) * 255
-        mask_high = cv2.bitwise_and(mask_high, glcm_evidence)
+        # Also flag abnormally LOW texture (smooth stains, holes) - global z-score
+        lower_bound = mean_ent - sensitivity * std_ent
+        low_texture_mask = cv2.inRange(final_anomaly_map, 0, int(max(0, lower_bound)))
 
-        mask_combined = mask_high
+        # Combine high and low anomaly masks
+        combined_binary = cv2.bitwise_or(combined_binary, low_texture_mask)
 
         # Global floor: ignore if not significantly deviant
         global_floor_high = mean_ent + sensitivity * std_ent * 0.5
         global_floor_low = mean_ent - sensitivity * std_ent * 0.5
         trivial = (final_entropy_map > global_floor_low) & (final_entropy_map < global_floor_high)
-        mask_combined[trivial] = 0
+        combined_binary[trivial] = 0
 
         # Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask_clean = cv2.morphologyEx(combined_binary, cv2.MORPH_CLOSE, kernel, iterations=2)
         mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel, iterations=1)
 
         # Connected-component extraction
@@ -280,8 +286,8 @@ class TextureInspector:
 
             # Z-score confidence
             defect_region_mask = labels == i
-            defect_entropy_vals = final_entropy_map[defect_region_mask]
-            defect_mean_ent = np.mean(defect_entropy_vals) if len(defect_entropy_vals) > 0 else mean_ent
+            defect_anomaly_vals = final_anomaly_map[defect_region_mask]
+            defect_mean_ent = np.mean(defect_anomaly_vals) if len(defect_anomaly_vals) > 0 else mean_ent
             z_distance = abs(defect_mean_ent - mean_ent) / max(std_ent, 1e-6)
             confidence = min(99, max(10, int((z_distance / max(sensitivity, 1e-6)) * 100)))
 
