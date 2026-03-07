@@ -768,15 +768,15 @@ with tab_inspect:
                 with c1:
                     with st.container(border=True):
                         st.caption("📷  Original")
-                        st.image(base_img, channels="BGR", use_container_width=True)
+                        st.image(base_img, channels="BGR", width="stretch")
                 with c2:
                     with st.container(border=True):
                         st.caption(f"🔴  Structural Defects ({s_count})")
-                        st.image(structural_overlay, channels="BGR", use_container_width=True)
+                        st.image(structural_overlay, channels="BGR", width="stretch")
                 with c3:
                     with st.container(border=True):
                         st.caption(f"🟡  Surface Defects ({f_count})")
-                        st.image(surface_overlay, channels="BGR", use_container_width=True)
+                        st.image(surface_overlay, channels="BGR", width="stretch")
 
                 # ── BEFORE / AFTER COMPARISON ──
                 if total > 0:
@@ -810,7 +810,7 @@ with tab_inspect:
                                 # Apply colormap if grayscale
                                 if len(viz_img.shape) == 2:
                                     viz_img = cv2.applyColorMap(viz_img, cv2.COLORMAP_JET)
-                                st.image(viz_img, channels="BGR", use_container_width=True)
+                                st.image(viz_img, channels="BGR", width="stretch")
 
 
                 # ── DEFECT TABLES ──
@@ -826,7 +826,7 @@ with tab_inspect:
                         preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
                         cols_order = [c for c in preferred if c in df_s.columns] + [c for c in df_s.columns if c not in preferred and not c.startswith("bbox")]
                         with st.container(border=True):
-                            st.dataframe(df_s[cols_order], use_container_width=True)
+                            st.dataframe(df_s[cols_order], width="stretch")
 
                     if surface:
                         st.markdown('<div class="cat-hdr cat-surface">🟡  Surface Defects — Visual / Textural</div>', unsafe_allow_html=True)
@@ -834,7 +834,7 @@ with tab_inspect:
                         preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
                         cols_order = [c for c in preferred if c in df_f.columns] + [c for c in df_f.columns if c not in preferred and not c.startswith("bbox")]
                         with st.container(border=True):
-                            st.dataframe(df_f[cols_order], use_container_width=True)
+                            st.dataframe(df_f[cols_order], width="stretch")
 
                     # Combined download
                     df_all = pd.DataFrame(all_defects)
@@ -969,7 +969,7 @@ with tab_batch:
         """, unsafe_allow_html=True)
 
         with st.container(border=True):
-            st.dataframe(df_s, use_container_width=True)
+            st.dataframe(df_s, width="stretch")
 
         if all_batch_defects:
             df_all = pd.DataFrame(all_batch_defects)
@@ -984,7 +984,7 @@ with tab_batch:
                 st.markdown('<div class="sec-title">🔥 Defect Cluster Heatmap</div>', unsafe_allow_html=True)
                 with st.container(border=True):
                     st.caption("Aggregate view — brighter regions have more defects across all images")
-                    st.image(heatmap_img, channels="BGR", use_container_width=True)
+                    st.image(heatmap_img, channels="BGR", width="stretch")
 
 
 # ══════════════════════════════════════════════
@@ -1025,4 +1025,4 @@ with tab_history:
         st.markdown('<div class="sec-title">Recent Inspections</div>', unsafe_allow_html=True)
         display_cols = [c for c in ["timestamp", "filename", "defect_count", "structural", "surface", "verdict"] if c in df_hist.columns]
         with st.container(border=True):
-            st.dataframe(df_hist[display_cols].iloc[::-1], use_container_width=True)
+            st.dataframe(df_hist[display_cols].iloc[::-1], width="stretch")
