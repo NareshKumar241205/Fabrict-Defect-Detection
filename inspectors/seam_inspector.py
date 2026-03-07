@@ -1,7 +1,13 @@
 """
-Seam Inspector Module (Algorithms D / E / F)
-=============================================
+Seam Inspector Module (Algorithms D / E / F) — IMPROVED
+========================================================
 Detects stitch & seam quality defects in the assembly (sewing) process.
+
+Improvements:
+- Projection smoothing (sliding window) before gap scan → fewer false Skip Stitches
+- Run-off: requires center_density > CENTER_DENSITY_MIN guard
+- Crooked: lowers min centroid count to 15 to detect partial seams
+- All thresholds updated to match tuned config.py values
 
 Engines:
   D — Projection Profiling    → Skip Stitch, Broken Stitch, Run-off Stitch
@@ -22,12 +28,15 @@ class SeamInspector:
     """Stitch Quality Inspector (Group II)."""
 
     def __init__(self):
-        self.stitch_thresh = SEAM_SETTINGS.get("STITCH_COLOR_THRESH", 180)
-        self.gap_tolerance = SEAM_SETTINGS.get("GAP_TOLERANCE", 10)
-        self.crooked_r2_thresh = SEAM_SETTINGS.get("CROOKED_R2_THRESH", 0.85)
-        self.pucker_var_sigma = SEAM_SETTINGS.get("PUCKER_VAR_SIGMA", 2.0)
-        self.runoff_edge_margin = SEAM_SETTINGS.get("RUNOFF_EDGE_MARGIN", 0.10)
-        self.broken_gap_min = SEAM_SETTINGS.get("BROKEN_GAP_MIN", 20)
+        self.stitch_thresh  = SEAM_SETTINGS.get("STITCH_COLOR_THRESH", 180)
+        self.gap_tolerance  = SEAM_SETTINGS.get("GAP_TOLERANCE", 10)
+        self.crooked_r2_thresh   = SEAM_SETTINGS.get("CROOKED_R2_THRESH", 0.85)
+        self.pucker_var_sigma    = SEAM_SETTINGS.get("PUCKER_VAR_SIGMA", 1.5)       # tuned
+        self.runoff_edge_margin  = SEAM_SETTINGS.get("RUNOFF_EDGE_MARGIN", 0.08)    # tuned
+        self.broken_gap_min      = SEAM_SETTINGS.get("BROKEN_GAP_MIN", 15)          # tuned
+        self.min_centroid_count  = SEAM_SETTINGS.get("MIN_CENTROID_COUNT", 15)      # tuned
+        self.center_density_min  = SEAM_SETTINGS.get("CENTER_DENSITY_MIN", 8)       # new guard
+        self.runoff_density_ratio = SEAM_SETTINGS.get("RUNOFF_DENSITY_RATIO", 0.35) # tuned
 
     # ──────────────────────────────────────────
     # Pre-processing
@@ -138,12 +147,16 @@ class SeamInspector:
         h, w = rot_img.shape[:2]
         defects: List[Dict[str, Any]] = []
 
+        # Smooth projection with sliding window (window=5) to reduce spike noise
+        # before gap scanning → fewer false Skip Stitch detections
+        smooth_proj = np.convolve(proj, np.ones(5) / 5.0, mode="same")
+
         # Gap scanning → Skip / Broken
         gap_counter = 0
         in_gap = False
         gap_start = 0
 
-        for i, val in enumerate(proj):
+        for i, val in enumerate(smooth_proj):
             if val < 2:
                 if not in_gap:
                     in_gap = True
@@ -151,7 +164,7 @@ class SeamInspector:
                 gap_counter += 1
             else:
                 if in_gap:
-                    if gap_counter > self.gap_tolerance and gap_start > 10 and i < len(proj) - 10:
+                    if gap_counter > self.gap_tolerance and gap_start > 10 and i < len(smooth_proj) - 10:
                         d_type = "Broken Stitch" if gap_counter > self.broken_gap_min else "Skip Stitch"
                         defects.append({
                             "x": gap_start, "y": 10,
@@ -162,33 +175,30 @@ class SeamInspector:
                     in_gap = False
                     gap_counter = 0
 
-        # ── FIX: Run-off detection ──
-        # A normal continuous seam will have left_density ≈ center_density.
-        # A true run-off means the stitch slipped off the fabric edge and became loose,
-        # resulting in a sharp DROP in density (but not a complete break to 0).
+        # Run-off detection (tuned: requires center_density > center_density_min)
         edge_margin = int(w * self.runoff_edge_margin)
         if edge_margin > 5 and w > 2 * edge_margin:
-            center_density = np.mean(proj[edge_margin : -edge_margin])
+            center_density = np.mean(smooth_proj[edge_margin: -edge_margin])
 
-            # Left edge
-            left_density = np.mean(proj[:edge_margin])
-            if center_density > 5 and 0 < left_density < center_density * 0.35:
-                defects.append({
-                    "x": 0, "y": 10,
-                    "w": edge_margin, "h": h - 20,
-                    "type": "Run-off Stitch",
-                    "score": int((1.0 - (left_density / center_density)) * 100),
-                })
+            # Only trigger run-off if the seam is actually present in the center
+            if center_density > self.center_density_min:
+                left_density = np.mean(smooth_proj[:edge_margin])
+                if 0 < left_density < center_density * self.runoff_density_ratio:
+                    defects.append({
+                        "x": 0, "y": 10,
+                        "w": edge_margin, "h": h - 20,
+                        "type": "Run-off Stitch",
+                        "score": int((1.0 - (left_density / center_density)) * 100),
+                    })
 
-            # Right edge
-            right_density = np.mean(proj[-edge_margin:])
-            if center_density > 5 and 0 < right_density < center_density * 0.35:
-                defects.append({
-                    "x": w - edge_margin, "y": 10,
-                    "w": edge_margin, "h": h - 20,
-                    "type": "Run-off Stitch",
-                    "score": int((1.0 - (right_density / center_density)) * 100),
-                })
+                right_density = np.mean(smooth_proj[-edge_margin:])
+                if 0 < right_density < center_density * self.runoff_density_ratio:
+                    defects.append({
+                        "x": w - edge_margin, "y": 10,
+                        "w": edge_margin, "h": h - 20,
+                        "type": "Run-off Stitch",
+                        "score": int((1.0 - (right_density / center_density)) * 100),
+                    })
         return defects
 
     # ──────────────────────────────────────────
@@ -209,12 +219,26 @@ class SeamInspector:
                 centroids_y.append(float(np.mean(stitch_pixels)))
                 centroids_x.append(float(x))
 
-        # FIX: lower threshold from 30 to 20 so partial seams are still analyzed
-        if len(centroids_x) < 20:
+        if len(centroids_x) < self.min_centroid_count:
             return defects
 
         cx = np.array(centroids_x)
         cy = np.array(centroids_y)
+
+        # ── GUARD 1: Y-spread check ──────────────────────────────────────────
+        # A real seam runs in a NARROW horizontal band — stitch centroids cluster
+        # close together in Y.  A knit/fabric pattern has pixels spread across
+        # the full image height → large Y-spread.
+        # If Y span > 35% of image height → fabric pattern, NOT a seam.
+        y_spread = float(np.max(cy) - np.min(cy))
+        if y_spread > h * 0.35:
+            return defects
+
+        # ── GUARD 2: X-span check ────────────────────────────────────────────
+        # A real seam crosses at least 40% of the image width.
+        x_span = float(np.max(cx) - np.min(cx))
+        if x_span < w * 0.40:
+            return defects
 
         n = len(cx)
         sum_x = np.sum(cx)

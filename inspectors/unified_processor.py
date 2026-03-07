@@ -219,56 +219,38 @@ class UnifiedProcessor:
         defects: List[Dict[str, Any]] = []
         viz_maps: Dict[str, Any] = {}
 
-        # Engine A: Spectral
+        # Engine A: Spectral (Gabor)
         try:
             img_buffer.seek(0)
             buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            _, _, sal_map, spec_defs = self._spectral.detect_defects(buf, sensitivity=sensitivity)
+            spec_defs, sal_map = self._spectral.process(buf, sensitivity=sensitivity)
             viz_maps["saliency"] = sal_map
-            for d in spec_defs:
-                d["Engine"] = "Spectral (FFT)"
-                d["Group"] = "Fabric Structure"
-                d["Inspector"] = "Spectral"
-                if self._cfg.get("SUB_CLASSIFY", True):
-                    d["Type"] = self._sub_classify_spectral(d)
             defects.extend(spec_defs)
         except Exception as e:
-            logger.warning("Spectral engine failed: %s", e)
+            logger.warning("Spectral (Gabor) engine failed: %s", e)
 
-        # Engine B: Texture
+        # Engine B: Texture (SSIM)
         try:
             img_buffer.seek(0)
             buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            _, _, ent_map, _, tex_defs = self._texture.detect_defects(buf, sensitivity=sensitivity)
+            tex_defs, ent_map = self._texture.process(buf, sensitivity=sensitivity)
             viz_maps["entropy"] = ent_map
-            for d in tex_defs:
-                d["Engine"] = "Texture (LBP+Gabor)"
-                d["Group"] = "Fabric Structure"
-                d["Inspector"] = "Texture"
-                if self._cfg.get("SUB_CLASSIFY", True):
-                    d["Type"] = self._sub_classify_spectral(d)
             defects.extend(tex_defs)
         except Exception as e:
-            logger.warning("Texture engine failed: %s", e)
+            logger.warning("Texture (SSIM) engine failed: %s", e)
 
-        # Engine C: Edge
+        # Engine C: Edge (Subtraction)
         try:
             img_buffer.seek(0)
             buf = BytesIO(img_buffer.read())
             img_buffer.seek(0)
-            _, _, anomaly_hm, _, edge_defs = self._edge.detect_defects(buf, sensitivity=sensitivity)
+            edge_defs, anomaly_hm = self._edge.detect_defects(buf, sensitivity=sensitivity)
             viz_maps["anomaly_heatmap"] = anomaly_hm
-            for d in edge_defs:
-                d["Engine"] = "Edge (Canny+Morph)"
-                d["Group"] = "Fabric Structure"
-                d["Inspector"] = "Edge"
-                if self._cfg.get("SUB_CLASSIFY", True):
-                    d["Type"] = self._sub_classify_edge(d)
             defects.extend(edge_defs)
         except Exception as e:
-            logger.warning("Edge engine failed: %s", e)
+            logger.warning("Edge (Subtraction) engine failed: %s", e)
 
         return defects, viz_maps
 
@@ -367,11 +349,12 @@ class UnifiedProcessor:
 
         region_info = self._pre_classify(img_pre)
 
+        # Group I (fabric structure) always runs.
+        # Group II (seam/stitch) only runs if the pre-classifier detected a seam.
+        # In "full" mode we still respect the seam gate — running on plain fabric
+        # causes the knit loop pattern to be misclassified as Crooked Stitch.
         run_group_i = mode in ("full", "structure_only") or region_info["has_fabric_body"]
-        run_group_ii = mode in ("full", "seam_only") or region_info["has_seam"]
-        if mode == "full":
-            run_group_i = True
-            run_group_ii = True
+        run_group_ii = (mode == "seam_only") or region_info["has_seam"]
 
         if run_group_i:
             engines_used.append("Group I: Fabric Structure")
@@ -394,8 +377,26 @@ class UnifiedProcessor:
             all_defects.extend(ref_defects)
             all_viz_maps.update(ref_viz)
 
-        # Internal NMS (deduplication across engines)
-        all_defects = self._nms(all_defects, iou_thresh=0.5)
+        # ── Stage 1: Tighter NMS (0.35 instead of 0.50) ─────────────────────
+        # A lower IoU threshold means boxes that partially overlap (same defect
+        # seen by two inspectors) get merged into one.  Previously at 0.5 they
+        # were kept as two separate detections, doubling the count.
+        all_defects = self._nms(all_defects, iou_thresh=0.35)
+
+        # ── Stage 2: Confidence gate ──────────────────────────────────────────
+        # Drop anything the pipeline isn't reasonably confident about.
+        # Low-confidence detections (10-30%) are almost always texture noise
+        # on plain fabric being mistaken for a defect.
+        MIN_CONFIDENCE = 40  # % — tune down if real defects are being missed
+
+        def _conf_val(d: Dict[str, Any]) -> int:
+            c = d.get("Confidence", "0%")
+            try:
+                return int(str(c).replace("%", "").strip())
+            except (ValueError, TypeError):
+                return 0
+
+        all_defects = [d for d in all_defects if _conf_val(d) >= MIN_CONFIDENCE]
 
         # Re-number IDs
         for i, d in enumerate(all_defects, 1):

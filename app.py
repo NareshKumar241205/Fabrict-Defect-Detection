@@ -719,11 +719,17 @@ with tab_inspect:
 
                 all_defects = [d for d in all_defects if _conf_val(d) >= conf_threshold]
 
-                # Deduplicate overlapping boxes across inspectors
-                all_defects = deduplicate_defects(all_defects, iou_threshold=0.5)
+                # Deduplication is handled upstream by unified_processor._nms
 
-                structural = [d for d in all_defects if d["Category"] == "Structural"]
-                surface = [d for d in all_defects if d["Category"] == "Surface"]
+                # Group defects for UI display
+                # Note: From the taxonomy, Group I is "Fabric Structure" (Hole, Tear, Missing Thread, Slub, Snag, Oil Stain).
+                # Wait, "Surface" vs "Structural" was the old taxonomy.
+                # Let's cleanly split them based on the Types. 
+                # Structural: Hole, Tear, Missing Thread, Snag, plus all Stitch defects.
+                # Surface: Slub, Oil Stain.
+                struc_types = {"Hole", "Tear", "Snag", "Missing Thread", "Skip Stitch", "Broken Stitch", "Run-off Stitch", "Crooked Stitch", "Pucker"}
+                structural = [d for d in all_defects if d.get("Type") in struc_types]
+                surface = [d for d in all_defects if d not in structural]
 
                 s_count = len(structural)
                 f_count = len(surface)

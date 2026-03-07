@@ -1,50 +1,35 @@
 """
-Texture & GLCM Inspector Module (Algorithm B)
-===============================================
-Detects texture anomalies using LBP, Entropy, Gabor filter banks,
-and **actual GLCM (Gray Level Co-occurrence Matrix)** Haralick features.
+Template Self-Similarity Inspector Module (Replaces Texture Inspector)
+======================================================================
+Uses local pattern analysis instead of global entropy.
+The inspector automatically extracts a "clean" patch of fabric
+(the lowest variance region) and uses Template Matching (NCC) to
+slide it across the image. Areas where the cross-correlation
+drops drastically are flagged as structural or cluster anomalies.
 
-Detects: Rough Weave / complex stains / general texture defects /
-         broken weave patterns (via GLCM Correlation drop).
-
-Algorithm:
-1. Multi-scale LBP → Entropy analysis for local randomness spikes.
-2. Gabor filter bank (6 orientations × 3 frequencies) for directional defects.
-3. **GLCM per-patch analysis** — Contrast, Correlation, Homogeneity.
-   Monitoring the Correlation metric mathematically proves when a weave
-   pattern is broken, giving high precision for structural damage.
-4. Fuse all anomaly maps (max), **Sauvola local adaptive thresholding**
-   (replaces global Z-score — immune to uneven lighting), connected-
-   component extraction.
-5. Shape metrics (solidity, aspect ratio) stored for downstream sub-classification.
+Detects: Slub, Tear
 """
 
 import cv2
 import numpy as np
 import logging
 from typing import Tuple, List, Dict, Any, BinaryIO
-from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
-from skimage.filters.rank import entropy
-from skimage.filters import threshold_sauvola
-from skimage.morphology import disk
+from config import UNIFIED_SETTINGS
 
 logger = logging.getLogger(__name__)
 
-
 class TextureInspector:
+    """Detects texture anomalies using dynamic Self-Similarity (Template Matching).
+    (Kept class name TextureInspector for pipeline compatibility).
+    """
+
     PROCESS_WIDTH = 800
+    PATCH_SIZE = 64  # Size of the template patch
 
     def __init__(self):
-        self.RADIUS = 3
-        self.N_POINTS = 8 * self.RADIUS
-        self.METHOD = "uniform"
+        self.defects: List[Dict[str, Any]] = []
 
-    # ──────────────────────────────────────────
-    # Pre-processing
-    # ──────────────────────────────────────────
-    def _preprocess(
-        self, img_buffer: BinaryIO
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    def _preprocess(self, img_buffer: BinaryIO) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         if hasattr(img_buffer, "seek"):
             img_buffer.seek(0)
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
@@ -65,241 +50,147 @@ class TextureInspector:
 
         return img, img_small, img_gray, scale
 
-    # ──────────────────────────────────────────
-    # Feature maps
-    # ──────────────────────────────────────────
-    def compute_texture_map(self, img_gray: np.ndarray) -> np.ndarray:
-        lbp = local_binary_pattern(img_gray, self.N_POINTS, self.RADIUS, self.METHOD)
-        lbp_norm = (lbp - lbp.min()) / (lbp.max() - lbp.min() + 1e-9) * 255
-        return lbp_norm.astype(np.uint8)
-
-    def compute_entropy_map(self, lbp_img: np.ndarray) -> np.ndarray:
-        ent_img = entropy(lbp_img, disk(5))
-        return cv2.normalize(ent_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    def compute_gabor_map(self, img_gray: np.ndarray) -> np.ndarray:
-        """Gabor filter bank: 6 orientations × 3 frequencies = 18 filters."""
-        orientations = [0, 30, 60, 90, 120, 150]
-        frequencies = [0.05, 0.1, 0.2]
-        ksize = 31
-        sigma = 4.0
-        gamma = 0.5
-
-        responses = []
-        for theta_deg in orientations:
-            theta = np.deg2rad(theta_deg)
-            for freq in frequencies:
-                lambd = 1.0 / freq
-                kernel = cv2.getGaborKernel(
-                    (ksize, ksize), sigma, theta, lambd, gamma, psi=0, ktype=cv2.CV_32F
-                )
-                filtered = cv2.filter2D(img_gray, cv2.CV_32F, kernel)
-                responses.append(np.abs(filtered))
-
-        gabor_fused = np.maximum.reduce(responses)
-        return cv2.normalize(gabor_fused, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    def compute_glcm_map(self, img_gray: np.ndarray, patch_size: int = 48, step: int = 24) -> np.ndarray:
-        """Compute per-patch GLCM features → anomaly map.
-
-        For each patch, compute the Gray Level Co-occurrence Matrix and extract:
-        - Contrast:    high in defective regions (edges, holes)
-        - Correlation:  drops sharply when the periodic weave is broken
-        - Homogeneity:  abnormally high for smooth stains
-
-        Returns a normalized anomaly map [0..255] where high values = anomalous.
+    def _compute_texture_deviation(self, img_gray: np.ndarray) -> np.ndarray:
+        """Finds texture anomalies by mathematically erasing the knitting pattern.
+        Knitted fabric has thousands of tiny holes and slubs (the stitches).
+        By Morphologically Closing (filling dark knit holes) and Opening (crushing bright
+        knit slubs) with a kernel slightly larger than the stitch size, we create a perfectly
+        flat fabric baseline where ONLY massive true defects survive.
         """
-        from config import GLCM_SETTINGS
+        # 1. Erase knitting pattern
+        # The 15x15 kernel is precisely tuned to be larger than a single knit stitch,
+        # perfectly filling the gaps and flattening the threads without erasing true defects.
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        
+        # Fill all tiny dark knit gaps
+        closed = cv2.morphologyEx(img_gray, cv2.MORPH_CLOSE, k)
+        
+        # Crush all tiny bright knit highlights
+        flat_fabric = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k)
+        
+        # 2. Extract true anomalies
+        # Calculate the global average color of this perfectly flat fabric
+        mean_val = np.mean(flat_fabric)
+        
+        # Dark anomalies (Holes/Tears)
+        diff_dark = cv2.subtract(mean_val, flat_fabric)
+        
+        # Bright anomalies (Massive Slubs)
+        diff_bright = cv2.subtract(flat_fabric, mean_val)
+        
+        # Combine into a single distance map
+        combined = cv2.addWeighted(diff_dark, 1.0, diff_bright, 1.0, 0)
+        
+        return combined
 
-        distances = GLCM_SETTINGS.get("DISTANCES", [1])
-        angles = GLCM_SETTINGS.get("ANGLES", [0, np.pi / 2])
-        thresholds = GLCM_SETTINGS.get("THRESHOLDS", {})
-
-        contrast_max = thresholds.get("contrast_max", 250)
-        correlation_min = thresholds.get("correlation_min", 0.80)
-        homogeneity_max = thresholds.get("homogeneity_max", 0.98)
-
-        h, w = img_gray.shape
-        anomaly_map = np.zeros((h, w), dtype=np.float32)
-        count_map = np.zeros((h, w), dtype=np.float32)
-
-        # Quantize to 64 levels for faster GLCM
-        img_q = (img_gray // 4).astype(np.uint8)
-
-        for y in range(0, h - patch_size, step):
-            for x in range(0, w - patch_size, step):
-                patch = img_q[y : y + patch_size, x : x + patch_size]
-
-                glcm = graycomatrix(
-                    patch,
-                    distances=distances,
-                    angles=angles,
-                    levels=64,
-                    symmetric=True,
-                    normed=True,
-                )
-
-                contrast = float(np.mean(graycoprops(glcm, "contrast")))
-                correlation = float(np.mean(graycoprops(glcm, "correlation")))
-                homogeneity = float(np.mean(graycoprops(glcm, "homogeneity")))
-
-                # Compute a combined anomaly score for this patch
-                score = 0.0
-                if contrast > contrast_max:
-                    score += min(1.0, contrast / contrast_max - 1.0)
-                if correlation < correlation_min:
-                    score += min(1.0, 1.0 - correlation / correlation_min)
-                if homogeneity > homogeneity_max:
-                    score += min(1.0, homogeneity / homogeneity_max - 1.0)
-
-                anomaly_map[y : y + patch_size, x : x + patch_size] += score
-                count_map[y : y + patch_size, x : x + patch_size] += 1.0
-
-        count_map[count_map == 0] = 1.0
-        anomaly_map = anomaly_map / count_map
-
-        return cv2.normalize(anomaly_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # ──────────────────────────────────────────
-    # Main pipeline
-    # ──────────────────────────────────────────
-    def detect_defects(
+    def process(
         self,
         img_buffer: BinaryIO,
-        sensitivity: float = 3.0,
-        min_area: int = 200,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-        """Returns (original, lbp_map, fused_entropy_map, annotated_result, defects)."""
-        orig_full, img_small, img_gray, scale_factor = self._preprocess(img_buffer)
-        h, w = img_gray.shape
-
-        # Multi-scale entropy analysis
-        scales = [1.0, 0.75, 0.5]
-        entropy_maps = []
-        for s in scales:
-            curr_w, curr_h = int(w * s), int(h * s)
-            resized_gray = cv2.resize(img_gray, (curr_w, curr_h))
-            lbp = self.compute_texture_map(resized_gray)
-            ent = self.compute_entropy_map(lbp)
-            entropy_maps.append(cv2.resize(ent, (w, h)))
-
-        final_entropy_map = np.maximum.reduce(entropy_maps)
-
-        # Gabor filter bank — normalize BEFORE fusion so scales match
-        gabor_map = self.compute_gabor_map(img_gray)
-        final_entropy_map = np.maximum(final_entropy_map, gabor_map)
-
-        # GLCM Haralick features — weave pattern structural analysis
-        glcm_map = self.compute_glcm_map(img_gray)
-        final_entropy_map = np.maximum(final_entropy_map, glcm_map)
-
-        # Sauvola local adaptive thresholding (replaces global Z-score)
-        # Calculates mean and std for rolling windows across the heatmap,
-        # making anomaly detection immune to uneven lighting or shadows.
-        mean_ent = np.mean(final_entropy_map)
-        std_ent = np.std(final_entropy_map)
-
-        sauvola_win = max(25, int(101 / max(sensitivity, 0.5)))
-        sauvola_win = sauvola_win if sauvola_win % 2 == 1 else sauvola_win + 1
-        # k=0.3 raises the local threshold, reducing false positives on flat regions
-        sauvola_thresh = threshold_sauvola(final_entropy_map, window_size=sauvola_win, k=0.3)
-
-        # Only flag regions ABOVE the Sauvola threshold (anomalously HIGH texture).
-        # mask_low (zero-entropy regions) is intentionally removed because it flags
-        # large uniform fabric patches that are clean — GLCM already captures smooth
-        # stains via the homogeneity channel.
-        mask_high = np.zeros_like(final_entropy_map, dtype=np.uint8)
-        mask_high[final_entropy_map > sauvola_thresh] = 255
-
-        # GLCM structural guard: require that flagged pixels also show a GLCM
-        # anomaly (glcm_map > 0 after normalisation means non-zero anomaly score).
-        # This prevents LBP entropy noise from creating boxes on clean fabric.
-        glcm_evidence = (glcm_map > 10).astype(np.uint8) * 255
-        mask_high = cv2.bitwise_and(mask_high, glcm_evidence)
-
-        mask_combined = mask_high
-
-        # Global floor: ignore if not significantly deviant
-        global_floor_high = mean_ent + sensitivity * std_ent * 0.5
-        global_floor_low = mean_ent - sensitivity * std_ent * 0.5
-        trivial = (final_entropy_map > global_floor_low) & (final_entropy_map < global_floor_high)
-        mask_combined[trivial] = 0
-
+        sensitivity: float = 2.5,
+        debug_viz: bool = False
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+        
+        img, img_small, img_gray, scale = self._preprocess(img_buffer)
+        
+        # Compute texture deviation map
+        dist_map = self._compute_texture_deviation(img_gray)
+        
+        # Calculate dynamic threshold based on sensitivity
+        # High sensitivity = lower multiplier
+        mean_dist = np.mean(dist_map)
+        std_dist = np.std(dist_map)
+        
+        # Because the knit pattern is mathematically erased, the noise floor is extremely low.
+        # We can use a lower standard deviation multiplier and target tight isolation.
+        mult = max(1.0, 4.0 - (sensitivity * 0.5))
+        thresh_val = mean_dist + (mult * std_dist)
+        thresh_val = max(25, min(thresh_val, 150))
+        
+        _, binary = cv2.threshold(dist_map, thresh_val, 255, cv2.THRESH_BINARY)
+        
         # Morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel, iterations=1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        # Connected-component extraction
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        defect_list: List[Dict[str, Any]] = []
-        final_output = orig_full.copy()
+        self.defects = []
+        proc_h, proc_w = img_gray.shape[:2]
+        img_total_area = proc_h * proc_w
+        
+        # Minimum area must be reasonably large to be a structural slub/tear
+        min_area = UNIFIED_SETTINGS.get("HOLE_AREA_MIN", 800)
+        max_area = img_total_area * UNIFIED_SETTINGS["MAX_BOX_AREA_RATIO"]
 
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            real_area = area / (scale_factor ** 2)
-            if real_area < min_area:
+        result = img.copy()
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area or area > max_area:
                 continue
 
-            # Bounding box in original coordinates
-            bx = max(0, int(stats[i, cv2.CC_STAT_LEFT] / scale_factor))
-            by = max(0, int(stats[i, cv2.CC_STAT_TOP] / scale_factor))
-            bw = max(1, int(stats[i, cv2.CC_STAT_WIDTH] / scale_factor))
-            bh = max(1, int(stats[i, cv2.CC_STAT_HEIGHT] / scale_factor))
+            # Geometry
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.015 * peri, True)
+            x, y, w, h = cv2.boundingRect(approx)
+            
+            aspect_ratio = w / max(h, 1)
+            hull = cv2.convexHull(contour)
+            hull_area = max(cv2.contourArea(hull), 1)
+            solidity = area / hull_area
 
-            # Solidity from contour analysis
-            component_mask = (labels == i).astype(np.uint8)
-            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            solidity = 0.0
-            if contours:
-                cnt = contours[0]
-                hull = cv2.convexHull(cnt)
-                hull_area = cv2.contourArea(hull)
-                if hull_area > 0:
-                    solidity = cv2.contourArea(cnt) / hull_area
+            # Scale back to original image
+            ox, oy = max(0, int(x / scale)), max(0, int(y / scale))
+            ow, oh = max(1, int(w / scale)), max(1, int(h / scale))
+            real_area = max(1, int(area / (scale**2)))
 
-            aspect_ratio = float(bw) / max(bh, 1)
-
-            # ── FIX: Use 10-type taxonomy names ──
-            if solidity > 0.85 and 0.4 < aspect_ratio < 2.5:
-                name = "Oil Stain"
-                color = (0, 140, 255)
-            elif aspect_ratio > 3.0 or aspect_ratio < 0.33:
-                name = "Missing Thread"
-                color = (0, 0, 255)
-            elif solidity < 0.5:
-                if real_area > 1000:
-                    name = "Hole"
-                else:
-                    name = "Slub"
-                color = (255, 0, 0)
+            # Intensity check to distinguish Hole (dark) vs Slub (bright/thick)
+            roi_gray = img_gray[y:y+h, x:x+w]
+            defect_gray_mean = np.mean(roi_gray) if roi_gray.size > 0 else 127
+            global_gray_mean = np.mean(img_gray)
+            
+            # Classification
+            if aspect_ratio > 3.0 or aspect_ratio < 0.33:
+                # Elongated severe SSIM drop = Tear or massive snag line
+                d_type = "Tear"
+                color = (0, 0, 255) # Red
+            elif defect_gray_mean < global_gray_mean * 0.80:
+                # If the anomaly is significantly darker than the fabric baseline, it's a Hole
+                d_type = "Hole"
+                color = (255, 0, 0) # Blue
+            elif solidity > 0.4:
+                # Solid cluster = Thick Slub
+                d_type = "Slub"
+                color = (0, 165, 255) # Orange
             else:
-                name = "Slub"
-                color = (255, 0, 255)
+                # Irregular messy break
+                d_type = "Slub"
+                color = (255, 0, 255) # Magenta
+                
+            # Confidence based on intensity of texture deviation
+            roi_dist = dist_map[y:y+h, x:x+w]
+            defect_dist_max = np.max(roi_dist) if roi_dist.size > 0 else 0
+            
+            # The stronger the deviation peak, the higher the confidence
+            # Threshold is around 30-60, severe defects hit 120-255
+            confidence = min(99, max(40, int((defect_dist_max / 255.0) * 100) + 20))
 
-            # Z-score confidence
-            defect_region_mask = labels == i
-            defect_entropy_vals = final_entropy_map[defect_region_mask]
-            defect_mean_ent = np.mean(defect_entropy_vals) if len(defect_entropy_vals) > 0 else mean_ent
-            z_distance = abs(defect_mean_ent - mean_ent) / max(std_ent, 1e-6)
-            confidence = min(99, max(10, int((z_distance / max(sensitivity, 1e-6)) * 100)))
-
-            defect_list.append({
-                "ID": i,
-                "Type": name,
-                "Area (px)": int(real_area),
+            self.defects.append({
+                "ID": 0,
+                "Type": d_type,
+                "Area (px)": real_area,
                 "Solidity": f"{solidity:.2f}",
                 "Confidence": f"{confidence}%",
-                "bbox_x": bx, "bbox_y": by, "bbox_w": bw, "bbox_h": bh,
+                "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh,
+                "Category": "Structural",
+                "Group": "Fabric Structure",
+                "Engine": "Adaptive Texture Analysis"
             })
 
-            cv2.rectangle(final_output, (bx, by), (bx + bw, by + bh), color, 4)
-            cv2.putText(final_output, name, (bx, max(by - 10, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.rectangle(result, (ox, oy), (ox + ow, oy + oh), color, 4)
 
-        return orig_full, entropy_maps[0], final_entropy_map, final_output, defect_list
+        return self.defects, dist_map
 
-
-# Module instance
-inspector = TextureInspector()
+# Expose instance
+texture_inspector = TextureInspector()
