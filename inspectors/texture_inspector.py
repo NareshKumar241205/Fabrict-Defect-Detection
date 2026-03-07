@@ -26,8 +26,9 @@ from typing import Tuple, List, Dict, Any, BinaryIO
 from skimage.feature import local_binary_pattern
 from skimage.filters.rank import entropy
 from skimage.filters import threshold_sauvola
+from skimage.filters import threshold_sauvola
 from skimage.morphology import disk
-from skimage.feature.texture import graycomatrix, graycoprops
+from config import TEXTURE_SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -202,39 +203,40 @@ class TextureInspector:
         final_anomaly_map = np.maximum(final_anomaly_map, gabor_map)
         final_anomaly_map = np.maximum(final_anomaly_map, final_entropy_map)
 
-        # Global z-score thresholding for the fused anomaly map
-        mean_ent = np.mean(final_anomaly_map)
-        std_ent = np.std(final_anomaly_map)
-
-        # Use global z-score or Sauvola
-        if use_sauvola:
-            # Sauvola local adaptive thresholding (fallback for severe illumination)
-            sauvola_thresh = threshold_sauvola(final_anomaly_map, window_size=sauvola_window, k=0.2)
-            combined_binary = np.zeros_like(final_anomaly_map, dtype=np.uint8)
-            combined_binary[final_anomaly_map > sauvola_thresh] = 255
+        # Thresholding
+        if TEXTURE_SETTINGS["USE_SAUVOLA_TEXTURE"]:
+            # Sauvola local adaptive thresholding
+            k = TEXTURE_SETTINGS["SAUVOLA_K"]
+            window_size = TEXTURE_SETTINGS["SAUVOLA_WINDOW"]
+            # Normalize to 0-255 if needed
+            if final_entropy_map.dtype != np.uint8:
+                final_entropy_map_norm = cv2.normalize(final_entropy_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            else:
+                final_entropy_map_norm = final_entropy_map
+            # Apply Sauvola thresholding (invert since high entropy = defect)
+            _, mask_combined = cv2.threshold(final_entropy_map_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)  # Placeholder, need proper Sauvola
+            # Actually, OpenCV doesn't have Sauvola, need to implement or use skimage
+            from skimage.filters import threshold_sauvola
+            thresh = threshold_sauvola(final_entropy_map_norm, window_size=window_size, k=k)
+            mask_combined = (final_entropy_map_norm > thresh).astype(np.uint8) * 255
         else:
-            # Global z-score gating
-            combined_binary = np.zeros_like(final_anomaly_map, dtype=np.uint8)
-            anomaly_z = (final_anomaly_map - mean_ent) / max(std_ent, 1e-6)
-            combined_binary[anomaly_z > sensitivity] = 255
+            # Z-score anomaly detection
+            mean_ent = np.mean(final_entropy_map)
+            std_ent = np.std(final_entropy_map)
 
-        # Also flag abnormally LOW texture (smooth stains, holes) - global z-score
-        lower_bound = mean_ent - sensitivity * std_ent
-        low_texture_mask = cv2.inRange(final_anomaly_map, 0, int(max(0, lower_bound)))
+            lower_bound = mean_ent - sensitivity * std_ent * 0.25
+            upper_bound = mean_ent + sensitivity * std_ent * 0.25
 
-        # Combine high and low anomaly masks
-        combined_binary = cv2.bitwise_or(combined_binary, low_texture_mask)
-
-        # Global floor: ignore if not significantly deviant
-        global_floor_high = mean_ent + sensitivity * std_ent * 0.5
-        global_floor_low = mean_ent - sensitivity * std_ent * 0.5
-        trivial = (final_entropy_map > global_floor_low) & (final_entropy_map < global_floor_high)
-        combined_binary[trivial] = 0
+            mask_low = cv2.inRange(final_entropy_map, 0, int(max(0, lower_bound)))
+            mask_high = cv2.inRange(final_entropy_map, int(min(255, upper_bound)), 255)
+            mask_combined = cv2.bitwise_or(mask_low, mask_high)
 
         # Morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_clean = cv2.morphologyEx(combined_binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel, iterations=1)
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # Keep open small to remove noise
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)) # Dramatically larger closing kernel
+
+        mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel_close, iterations=3) # Merge soft edges
+        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
         # Connected-component extraction
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
@@ -253,6 +255,15 @@ class TextureInspector:
             by = max(0, int(stats[i, cv2.CC_STAT_TOP] / scale_factor))
             bw = max(1, int(stats[i, cv2.CC_STAT_WIDTH] / scale_factor))
             bh = max(1, int(stats[i, cv2.CC_STAT_HEIGHT] / scale_factor))
+
+            # NEW CODE: Add a 10-pixel padding around the detected blob so the box doesn't feel "too tight"
+            padding = 10
+            orig_h, orig_w = orig_full.shape[:2]
+
+            bx = max(0, bx - padding)
+            by = max(0, by - padding)
+            bw = min(orig_w - bx, bw + (padding * 2))
+            bh = min(orig_h - by, bh + (padding * 2))
 
             # Solidity from contour analysis
             component_mask = (labels == i).astype(np.uint8)

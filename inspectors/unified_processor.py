@@ -367,10 +367,15 @@ class UnifiedProcessor:
 
         region_info = self._pre_classify(img_pre)
 
-        run_group_i = mode in ("full", "structure_only") or region_info["has_fabric_body"]
-        run_group_ii = mode in ("full", "seam_only") or region_info["has_seam"]
+        # Let the pre-classifier intelligently decide in "full" mode!
         if mode == "full":
+            run_group_i = region_info.get("has_fabric_body", True)
+            run_group_ii = region_info.get("has_seam", False)
+        elif mode == "structure_only":
             run_group_i = True
+            run_group_ii = False
+        elif mode == "seam_only":
+            run_group_i = False
             run_group_ii = True
 
         if run_group_i:

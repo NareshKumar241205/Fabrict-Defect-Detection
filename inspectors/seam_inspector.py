@@ -356,11 +356,11 @@ class SeamInspector:
         # 2. Stitch mask + projection
         thread_mask, proj = self._extract_stitch_mask(rot_img)
 
-        # Bail out if barely any stitch signal
+        # Bail out if there's barely any signal OR if the signal is massive background noise
         stitch_density = np.count_nonzero(thread_mask) / max(
             thread_mask.shape[0] * thread_mask.shape[1], 1
         )
-        if stitch_density < 0.01:
+        if stitch_density < 0.015 or stitch_density > 0.35:
             return img_orig, None, None, img_small.copy(), []
 
         # 3. Run all three engines

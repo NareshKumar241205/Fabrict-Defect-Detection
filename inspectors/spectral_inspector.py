@@ -178,28 +178,19 @@ class SpectralInspector:
         # 2. Global z-score thresholding for FFT saliency
         mean_sal = np.mean(saliency_map)
         std_sal = np.std(saliency_map)
+        thresh_val = mean_sal + sensitivity * std_sal
+        _, binary_map = cv2.threshold(saliency_map, thresh_val, 255, cv2.THRESH_BINARY)
 
-        if use_sauvola:
-            # Sauvola local adaptive thresholding (optional fallback)
-            sauvola_thresh = threshold_sauvola(saliency_map, window_size=sauvola_window, k=0.2)
-            binary_map = np.zeros_like(saliency_map, dtype=np.uint8)
-            binary_map[saliency_map > sauvola_thresh] = 255
-        else:
-            # Global z-score thresholding
-            binary_map = np.zeros_like(saliency_map, dtype=np.uint8)
-            saliency_z = (saliency_map - mean_sal) / max(std_sal, 1e-6)
-            binary_map[saliency_z > sensitivity] = 255
-
-        # Maintain a global floor so noise in flat regions is ignored
-        global_floor = mean_sal + sensitivity * std_sal * 0.5
-        binary_map[saliency_map < global_floor] = 0
-
-        # 2b. Morphological ops: open first to kill isolated noise, then small close
-        # to reconnect genuinely fragmented detections without merging distant blobs.
+        # 2b. Morphological ops: CLOSE FIRST to fuse the fragmented thread, 
+        # then OPEN to remove the background noise.
+        
+        # Use a large 25x25 kernel to bridge large vertical/horizontal gaps
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+        binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+        
+        # Use a small kernel to clean up speckles after the thread is fused
         kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_OPEN, kernel_open)
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_CLOSE, kernel_close)
+        binary_map = cv2.morphologyEx(binary_map, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
         # 3. Defect extraction
         contours, _ = cv2.findContours(

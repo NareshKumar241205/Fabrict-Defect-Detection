@@ -109,3 +109,10 @@ UNIFIED_SETTINGS = {
     "SPECTRAL_WEIGHT": 0.8,            # Weight for spectral maps
     "EDGE_WEIGHT": 0.5,                # Weight for edge maps
 }
+
+# --- TEXTURE THRESHOLDING ---
+TEXTURE_SETTINGS = {
+    "USE_SAUVOLA_TEXTURE": False,  # If True, use Sauvola local thresholding instead of global Z-score
+    "SAUVOLA_K": 0.34,             # Sauvola parameter: lower = more sensitive to soft edges
+    "SAUVOLA_WINDOW": 25,          # Window size for local thresholding (odd number)
+}

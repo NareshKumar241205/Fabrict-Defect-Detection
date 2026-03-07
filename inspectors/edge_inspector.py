@@ -239,13 +239,14 @@ class EdgeInspector:
         if use_frangi:
             combined_mask = cv2.bitwise_or(combined_mask, frangi_mask)
 
-        # 5. Morphological cleanup: open first to remove isolated speckles,
-        #    then close to reconnect legitimate fragmented detections.
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        # 4. Morphological cleanup: CLOSE FIRST to reconnect legitimate fragmented detections,
+        # then OPEN to remove isolated noise.
+        
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+        
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
         # 6. Extract defects
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined_mask, connectivity=8)
