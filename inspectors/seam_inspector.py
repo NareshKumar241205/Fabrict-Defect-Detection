@@ -209,8 +209,9 @@ class SeamInspector:
                 centroids_y.append(float(np.mean(stitch_pixels)))
                 centroids_x.append(float(x))
 
-        # FIX: lower threshold from 30 to 20 so partial seams are still analyzed
-        if len(centroids_x) < 20:
+        # Require the detected thread to span at least 15% of the image width 
+        # before we attempt to calculate straightness/regression.
+        if len(centroids_x) < (w * 0.15):
             return defects
 
         cx = np.array(centroids_x)
