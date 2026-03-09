@@ -1,469 +1,146 @@
-"""
-FabricQA — Automated Fabric Defect Detection
-==============================================
-Upload an image → Unified Processor routes to correct engines
-→ results categorized into Group I (Structure) and Group II (Stitch).
-"""
+# app.py
+import os
 
 import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-import json
-import os
-import base64
-import tempfile
 from io import BytesIO
-from datetime import datetime
 from fpdf import FPDF
+import tempfile
+import base64
 
-from inspectors import texture_inspector, spectral_inspector, seam_inspector, edge_inspector
 from inspectors.unified_processor import unified_processor
 
-# ──────────────────────────────────────────────
-# DEFECT CLASSIFICATION MAP (10-Type Taxonomy)
-# ──────────────────────────────────────────────
-# Group I: Fabric Structure defects (physical / pattern anomalies)
-GROUP_I_TYPES = {
-    "Missing Thread", "Slub", "Oil Stain",
-    "Hole", "Tear", "Snag",
+# STRICT TAXONOMY RESTRICTION
+ALLOWED_TYPES = {
+    # Pipeline 1 (N)
+    "Oil Stain", "Hole", "Tear",
+    # Pipeline 2 (A)
+    "Slub", "Skip/Miss Stitch", "Crooked Stitch", "Skip Stitch", "Broken Stitch", "Run-off Stitch"
 }
-# Group II: Stitch Quality defects (seam-related)
-GROUP_II_TYPES = {
-    "Skip Stitch", "Broken Stitch", "Run-off Stitch",
-    "Crooked Stitch", "Pucker",
-}
-# Structural = physically damaging; Surface = visual/textural
+
 STRUCTURAL_TYPES = {
-    "Missing Thread", "Hole", "Tear", "Snag",
-    "Skip Stitch", "Broken Stitch", "Run-off Stitch", "Crooked Stitch",
+    "Hole", "Tear", "Skip/Miss Stitch", "Crooked Stitch", "Skip Stitch", "Broken Stitch", "Run-off Stitch"
 }
 SURFACE_TYPES = {
-    "Slub", "Oil Stain", "Pucker",
+    "Oil Stain", "Slub"
 }
 
-def classify_defect(defect_type: str) -> str:
-    """Categorize a defect as Structural or Surface."""
-    if defect_type in STRUCTURAL_TYPES:
-        return "Structural"
-    if defect_type in SURFACE_TYPES:
-        return "Surface"
-    # fallback heuristic
-    low = defect_type.lower()
-    if any(k in low for k in ("tear", "hole", "cut", "stitch", "break", "weave", "thread", "snag")):
-        return "Structural"
-    return "Surface"
-
-# ──────────────────────────────────────────────
-# PAGE CONFIG
-# ──────────────────────────────────────────────
-st.set_page_config(
-    page_title="FabricQA · Defect Detection",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ──────────────────────────────────────────────
-# DARK MODE CSS
-# ──────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-
-:root {
-    --bg-primary:    #0a0e17;
-    --bg-secondary:  #111827;
-    --bg-card:       rgba(17, 24, 39, 0.7);
-    --bg-glass:      rgba(255, 255, 255, 0.03);
-    --border:        rgba(255, 255, 255, 0.06);
-    --border-glow:   rgba(99, 102, 241, 0.15);
-    --text-primary:  #f1f5f9;
-    --text-secondary:#94a3b8;
-    --text-muted:    #64748b;
-    --accent:        #818cf8;
-    --accent-bright: #a78bfa;
-    --accent-glow:   rgba(129, 140, 248, 0.15);
-    --success:       #34d399;
-    --success-bg:    rgba(52, 211, 153, 0.1);
-    --danger:        #f87171;
-    --danger-bg:     rgba(248, 113, 113, 0.1);
-    --warning:       #fbbf24;
-    --warning-bg:    rgba(251, 191, 36, 0.1);
-    --structural-clr:#f87171;
-    --structural-bg: rgba(248, 113, 113, 0.08);
-    --surface-clr:   #fbbf24;
-    --surface-bg:    rgba(251, 191, 36, 0.08);
-    --gradient-2:    linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a78bfa 100%);
-    --gradient-3:    linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
-    --shadow:        0 4px 24px rgba(0, 0, 0, 0.4);
-    --shadow-glow:   0 0 30px rgba(99, 102, 241, 0.08);
-    --radius:        16px;
-    --radius-sm:     10px;
+DEFECT_COLORS = {
+    "Hole": (60, 60, 255), "Tear": (50, 50, 220), "Skip/Miss Stitch": (80, 80, 240),
+    "Crooked Stitch": (200, 0, 200), "Skip Stitch": (150, 0, 150), "Broken Stitch": (100, 0, 100), "Run-off Stitch": (120, 100, 200),
+    "Slub": (30, 180, 255), "Oil Stain": (20, 140, 220),
 }
 
-html, body, [class*="stApp"] {
-    font-family: 'Inter', -apple-system, sans-serif !important;
-    background: var(--bg-primary) !important;
-    color: var(--text-primary) !important;
-}
-
-#MainMenu, footer, header { visibility: hidden !important; }
-div[data-testid="stDecoration"] { display: none !important; }
-.stDeployButton { display: none !important; }
-
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: var(--bg-primary); }
-::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 3px; }
-
-/* ── Hero ── */
-.hero-banner {
-    background: var(--gradient-3);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 2rem 2.5rem;
-    margin-bottom: 1.8rem;
-    position: relative;
-    overflow: hidden;
-    box-shadow: var(--shadow-glow);
-}
-.hero-banner::before {
-    content: '';
-    position: absolute;
-    top: -50%; right: -20%;
-    width: 400px; height: 400px;
-    background: radial-gradient(circle, rgba(99,102,241,0.12) 0%, transparent 70%);
-    pointer-events: none;
-}
-.hero-banner h1 {
-    margin: 0; font-size: 1.8rem; font-weight: 800;
-    background: var(--gradient-2);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    background-clip: text; letter-spacing: -0.5px;
-}
-.hero-banner p {
-    margin: 6px 0 0; font-size: 0.85rem;
-    color: var(--text-secondary); font-weight: 400; letter-spacing: 0.3px;
-}
-
-/* ── Section Titles ── */
-.sec-title {
-    font-size: 0.7rem; font-weight: 700; color: var(--accent);
-    text-transform: uppercase; letter-spacing: 1.5px;
-    margin: 2rem 0 0.8rem; padding-bottom: 8px;
-    border-bottom: 1px solid var(--border);
-}
-
-/* ── Metric cards ── */
-.metrics-row { display: flex; gap: 16px; margin: 1.2rem 0; }
-.m-card {
-    flex: 1;
-    background: var(--bg-card); backdrop-filter: blur(12px);
-    border: 1px solid var(--border); border-radius: var(--radius-sm);
-    padding: 1.2rem 1.4rem; text-align: center;
-    box-shadow: var(--shadow);
-    transition: border-color 0.3s ease, transform 0.2s ease;
-}
-.m-card:hover { border-color: var(--border-glow); transform: translateY(-1px); }
-.m-card .m-val {
-    font-size: 1.8rem; font-weight: 800;
-    background: var(--gradient-2);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
-}
-.m-card .m-lbl {
-    font-size: 0.65rem; color: var(--text-muted);
-    text-transform: uppercase; letter-spacing: 1px;
-    margin-top: 4px; font-weight: 600;
-}
-
-/* ── Category headers ── */
-.cat-hdr {
-    display: flex; align-items: center; gap: 10px;
-    padding: 0.7rem 1.2rem; border-radius: var(--radius-sm);
-    margin-bottom: 0.8rem; font-weight: 700; font-size: 0.95rem;
-}
-.cat-structural {
-    background: var(--structural-bg);
-    border: 1px solid rgba(248,113,113,0.2);
-    color: var(--structural-clr);
-}
-.cat-surface {
-    background: var(--surface-bg);
-    border: 1px solid rgba(251,191,36,0.2);
-    color: var(--surface-clr);
-}
-
-/* ── Badges ── */
-.badge-pass {
-    display: inline-block; background: var(--success-bg); color: var(--success);
-    font-weight: 700; padding: 4px 18px; border-radius: 20px; font-size: 0.9rem;
-    border: 1px solid rgba(52,211,153,0.2); letter-spacing: 0.5px;
-}
-.badge-fail {
-    display: inline-block; background: var(--danger-bg); color: var(--danger);
-    font-weight: 700; padding: 4px 18px; border-radius: 20px; font-size: 0.9rem;
-    border: 1px solid rgba(248,113,113,0.2); letter-spacing: 0.5px;
-}
-
-/* ── Empty state ── */
-.empty-state {
-    text-align: center; padding: 4rem 2rem;
-    background: var(--bg-card); backdrop-filter: blur(12px);
-    border: 1px solid var(--border); border-radius: var(--radius);
-    box-shadow: var(--shadow);
-}
-.empty-state .icon { font-size: 3rem; margin-bottom: 0.5rem; opacity: 0.6; }
-.empty-state p { color: var(--text-muted); margin-top: 8px; font-size: 0.9rem; }
-
-/* ── Streamlit overrides ── */
-div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlockBorderWrapper"] {
-    background: var(--bg-card) !important; backdrop-filter: blur(12px) !important;
-    border-radius: var(--radius-sm) !important; border: 1px solid var(--border) !important;
-    box-shadow: var(--shadow) !important;
-}
-label, .stSlider label, .stRadio label, .stFileUploader label,
-div[data-testid="stWidgetLabel"] p, div[data-testid="stMarkdownContainer"] p,
-.stSelectbox label, .stMultiSelect label { color: var(--text-secondary) !important; }
-div[data-testid="stCaptionContainer"] { color: var(--text-muted) !important; }
-div[data-testid="stSlider"] div[role="slider"] { background-color: var(--accent) !important; }
-
-.stButton > button {
-    border-radius: var(--radius-sm) !important; font-weight: 600 !important;
-    font-size: 0.78rem !important; letter-spacing: 0.2px !important;
-    transition: all 0.25s ease !important; border: 1px solid var(--border) !important;
-    padding: 0.55rem 1rem !important;
-}
-.stButton > button[kind="secondary"], .stButton > button:not([kind="primary"]) {
-    background: var(--bg-glass) !important; color: var(--text-secondary) !important;
-}
-.stButton > button[kind="secondary"]:hover, .stButton > button:not([kind="primary"]):hover {
-    background: var(--accent-glow) !important; color: var(--accent) !important;
-    border-color: var(--accent) !important;
-}
-.stButton > button[kind="primary"] {
-    background: var(--gradient-2) !important; color: white !important;
-    border: none !important; box-shadow: 0 2px 12px rgba(99,102,241,0.3) !important;
-}
-.stButton > button[kind="primary"]:hover {
-    box-shadow: 0 4px 20px rgba(99,102,241,0.5) !important; transform: translateY(-1px);
-}
-
-div[data-testid="stFileUploader"] section {
-    background: var(--bg-glass) !important;
-    border: 1px dashed var(--border) !important;
-    border-radius: var(--radius-sm) !important;
-}
-div[data-testid="stDataFrame"] { border-radius: var(--radius-sm) !important; overflow: hidden; }
-.stDownloadButton > button {
-    background: var(--bg-glass) !important; color: var(--accent) !important;
-    border: 1px solid var(--accent) !important; border-radius: var(--radius-sm) !important;
-}
-.stDownloadButton > button:hover { background: var(--accent-glow) !important; }
-div[data-testid="stAlert"] {
-    background: var(--bg-card) !important; border-radius: var(--radius-sm) !important;
-    border: 1px solid var(--border) !important;
-}
-div[data-testid="stProgress"] > div > div > div { background: var(--gradient-2) !important; }
-details {
-    background: var(--bg-card) !important; border: 1px solid var(--border) !important;
-    border-radius: var(--radius-sm) !important;
-}
-details summary { color: var(--text-secondary) !important; }
-button[data-baseweb="tab"] { color: var(--text-muted) !important; }
-button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent) !important; }
-section[data-testid="stSidebar"] { background: var(--bg-secondary) !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ──────────────────────────────────────────────
-# HISTORY HELPER
-# ──────────────────────────────────────────────
-HISTORY_FILE = os.path.join(os.path.dirname(__file__), "inspection_history.json")
-
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+import json
+from datetime import datetime
 
 def save_history(entry):
-    history = load_history()
+    try:
+        with open("inspection_history.json", "r") as f:
+            history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        history = []
     history.append(entry)
-    history = history[-200:]
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=2, default=str)
+    with open("inspection_history.json", "w") as f:
+        json.dump(history, f, indent=2)
 
+def load_history():
+    try:
+        with open("inspection_history.json", "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
 
-# ──────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────
+st.set_page_config(page_title="Parallel Pipeline FabricQA", layout="wide")
+
 def clone_buffer(f):
-    if f is None:
-        return None
+    if f is None: return None
     f.seek(0)
     return BytesIO(f.read())
 
-
-def validate_image(img_file):
-    if img_file is None:
-        return None, None
-    img_file.seek(0)
-    file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    img_file.seek(0)
-    if img is None:
-        return None, "❌ Could not decode image. File may be corrupt."
-    h, w = img.shape[:2]
-    if h < 100 or w < 100:
-        return None, f"❌ Image too small ({w}×{h}). Min 100×100."
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if np.std(gray) < 5:
-        return None, "⚠️ Image appears blank or solid color."
-    return img, None
-
-
-def deduplicate_defects(defects, iou_threshold=0.5):
-    """Remove overlapping defects using Non-Maximum Suppression.
-    
-    When two defect boxes overlap >= iou_threshold, the one with
-    lower confidence is dropped.
-    """
-    if len(defects) <= 1:
-        return defects
-
-    def _conf(d):
-        c = d.get("Confidence", "0%")
-        try: return int(str(c).replace("%", "").strip())
-        except: return 0
-
-    def _iou(a, b):
-        ax1, ay1 = a.get("bbox_x", 0), a.get("bbox_y", 0)
-        ax2 = ax1 + a.get("bbox_w", 0)
-        ay2 = ay1 + a.get("bbox_h", 0)
-        bx1, by1 = b.get("bbox_x", 0), b.get("bbox_y", 0)
-        bx2 = bx1 + b.get("bbox_w", 0)
-        by2 = by1 + b.get("bbox_h", 0)
-
-        ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
-        ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
-        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        
-        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-        area_b = max(1, (bx2 - bx1) * (by2 - by1))
-        union = area_a + area_b - inter
-        return inter / max(union, 1)
-
-    # Sort by confidence descending
-    sorted_defs = sorted(defects, key=_conf, reverse=True)
-    keep = []
-
-    for d in sorted_defs:
-        suppressed = False
-        for kept in keep:
-            if _iou(d, kept) >= iou_threshold:
-                suppressed = True
-                break
-        if not suppressed:
-            keep.append(d)
-
-    return keep
-
-
 def decode_image(img_file):
-    """Read an image file into a BGR numpy array."""
     img_file.seek(0)
     file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-    img_file.seek(0)
     return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-
-# ── PDF REPORT ──
-def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defects, verdict, s_count, f_count):
-    """Generate a PDF report with images, defect table, and verdict."""
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-
-    # Helper: save BGR image to temp JPEG, return path
-    def _save_temp(bgr_img):
-        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        cv2.imwrite(tmp.name, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        return tmp.name
-
-    tmp_files = []
-
+def validate_image(img_file):
     try:
-        # Page 1: Header + Verdict + Images
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 22)
-        pdf.cell(0, 12, "FabricQA - Inspection Report", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(5)
+        img = decode_image(img_file)
+        if img is None:
+            return None, "Invalid image file or unsupported format."
+        return img, None
+    except Exception as e:
+        return None, f"Error loading image: {str(e)}"
 
-        # Verdict
-        pdf.set_font("Helvetica", "B", 16)
-        color = (220, 53, 69) if verdict == "FAIL" else (40, 167, 69)
-        pdf.set_text_color(*color)
-        pdf.cell(0, 10, f"Verdict: {verdict}", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(0, 0, 0)
+def classify_defect(defect_type):
+    if defect_type in STRUCTURAL_TYPES:
+        return "Structural"
+    elif defect_type in SURFACE_TYPES:
+        return "Surface"
+    else:
+        return "Unknown"
 
-        pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 7, f"Total Defects: {s_count + f_count}  |  Structural: {s_count}  |  Surface: {f_count}", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(5)
+def deduplicate_defects(defects, iou_threshold=0.5):
+    """Remove overlapping defects based on IoU threshold."""
+    if not defects:
+        return defects
+    
+    # Sort by confidence (highest first) to keep better detections
+    defects = sorted(defects, key=lambda d: _conf_val(d), reverse=True)
+    
+    kept = []
+    for defect in defects:
+        # Check if this defect overlaps significantly with any kept defect
+        should_keep = True
+        for kept_defect in kept:
+            if calculate_iou(defect, kept_defect) > iou_threshold:
+                should_keep = False
+                break
+        if should_keep:
+            kept.append(defect)
+    
+    return kept
 
-        # Images
-        img_w = 58
-        for label, img in [("Original", base_img), ("Structural", structural_overlay), ("Surface", surface_overlay)]:
-            tmp = _save_temp(img)
-            tmp_files.append(tmp)
+def calculate_iou(defect1, defect2):
+    """Calculate Intersection over Union for two defects."""
+    x1_1 = defect1.get("bbox_x", 0)
+    y1_1 = defect1.get("bbox_y", 0)
+    w1 = defect1.get("bbox_w", 0)
+    h1 = defect1.get("bbox_h", 0)
+    x2_1 = x1_1 + w1
+    y2_1 = y1_1 + h1
+    
+    x1_2 = defect2.get("bbox_x", 0)
+    y1_2 = defect2.get("bbox_y", 0)
+    w2 = defect2.get("bbox_w", 0)
+    h2 = defect2.get("bbox_h", 0)
+    x2_2 = x1_2 + w2
+    y2_2 = y1_2 + h2
+    
+    # Calculate intersection
+    x1_inter = max(x1_1, x1_2)
+    y1_inter = max(y1_1, y1_2)
+    x2_inter = min(x2_1, x2_2)
+    y2_inter = min(y2_1, y2_2)
+    
+    inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
+    
+    # Calculate union
+    area1 = w1 * h1
+    area2 = w2 * h2
+    union_area = area1 + area2 - inter_area
+    
+    if union_area == 0:
+        return 0
+    
+    return inter_area / union_area
 
-        pdf.set_font("Helvetica", "B", 10)
-        x_start = 10
-        for i, label in enumerate(["Original", "Structural Defects", "Surface Defects"]):
-            x = x_start + i * 63
-            pdf.set_xy(x, pdf.get_y())
-            pdf.cell(img_w, 5, label)
-
-        y_img = pdf.get_y() + 6
-        for i, tmp in enumerate(tmp_files):
-            pdf.image(tmp, x=x_start + i * 63, y=y_img, w=img_w)
-
-        # Page 2: Defect Table
-        if all_defects:
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", 14)
-            pdf.cell(0, 10, "Defect Details", new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(3)
-
-            # Table header
-            headers = ["#", "Category", "Type", "Area (px)", "Confidence"]
-            col_w = [10, 30, 50, 25, 25]
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.set_fill_color(240, 240, 240)
-            for j, h in enumerate(headers):
-                pdf.cell(col_w[j], 7, h, border=1, fill=True)
-            pdf.ln()
-
-            # Table rows
-            pdf.set_font("Helvetica", "", 8)
-            for idx, d in enumerate(all_defects[:50], 1):  # cap at 50 rows
-                pdf.cell(col_w[0], 6, str(idx), border=1)
-                pdf.cell(col_w[1], 6, d.get("Category", ""), border=1)
-                pdf.cell(col_w[2], 6, d.get("Type", "")[:30], border=1)
-                pdf.cell(col_w[3], 6, str(d.get("Area (px)", "")), border=1)
-                pdf.cell(col_w[4], 6, str(d.get("Confidence", "")), border=1)
-                pdf.ln()
-
-        return pdf.output()
-
-    finally:
-        for f in tmp_files:
-            try: os.unlink(f)
-            except: pass
+def _conf_val(d):
+    c = d.get("Confidence", "0%")
+    try: return int(str(c).replace("%", "").strip())
+    except: return 0
 
 
 # ── BEFORE/AFTER COMPARISON SLIDER ──
@@ -559,6 +236,85 @@ def generate_defect_heatmap(all_defects, canvas_size=600):
     return colored
 
 
+def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defects, verdict, s_count, f_count):
+    """Generate a PDF report with inspection results."""
+    try:
+        pdf = FPDF()
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.cell(0, 12, "Parallel Pipeline FabricQA - Inspection Report", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+
+        # Verdict
+        pdf.set_font("Helvetica", "B", 16)
+        color = (220, 53, 69) if verdict == "FAIL" else (40, 167, 69)
+        pdf.set_text_color(*color)
+        pdf.cell(0, 10, f"Verdict: {verdict}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 7, f"Total Defects: {s_count + f_count}  |  Structural: {s_count}  |  Surface: {f_count}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+
+        # Save images temporarily
+        tmp_files = []
+        for label, img in [("Original", base_img), ("Structural", structural_overlay), ("Surface", surface_overlay)]:
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                cv2.imwrite(tmp.name, cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                tmp_files.append(tmp.name)
+
+        # Images
+        img_w = 58
+        pdf.set_font("Helvetica", "B", 10)
+        x_start = 10
+        for i, label in enumerate(["Original", "Structural Defects", "Surface Defects"]):
+            x = x_start + i * 63
+            pdf.set_xy(x, pdf.get_y())
+            pdf.cell(img_w, 5, label)
+        y_img = pdf.get_y() + 6
+        for i, tmp in enumerate(tmp_files):
+            pdf.image(tmp, x=x_start + i * 63, y=y_img, w=img_w)
+
+        # Page 2: Defect Table
+        if all_defects:
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.cell(0, 10, "Defect Details", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(3)
+
+            headers = ["#", "Category", "Type", "Area (px)", "Confidence"]
+            col_w = [10, 30, 50, 25, 25]
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(240, 240, 240)
+            for j, h in enumerate(headers):
+                pdf.cell(col_w[j], 7, h, border=1, fill=True)
+            pdf.ln()
+            # Table rows
+            pdf.set_font("Helvetica", "", 8)
+            for idx, d in enumerate(all_defects[:50], 1):  # cap at 50 rows
+                pdf.cell(col_w[0], 6, str(idx), border=1)
+                pdf.cell(col_w[1], 6, d.get("Category", ""), border=1)
+                pdf.cell(col_w[2], 6, d.get("Type", "")[:30], border=1)
+                pdf.cell(col_w[3], 6, str(d.get("Area (px)", "")), border=1)
+                pdf.cell(col_w[4], 6, str(d.get("Confidence", "")), border=1)
+                pdf.ln()
+
+        pdf_output = BytesIO()
+        pdf.output(pdf_output)
+        pdf_bytes = pdf_output.getvalue()
+
+        # Clean up temp files
+        for f in tmp_files:
+            try:
+                os.unlink(f)
+            except:
+                pass
+
+        return pdf_bytes
+    except Exception as e:
+        raise e
+
+
 # ── FEEDBACK LOOP ──
 FEEDBACK_FILE = "feedback_log.json"
 
@@ -636,7 +392,7 @@ def draw_category_overlay(base_img, defects, color_bgr, label_prefix):
 # ──────────────────────────────────────────────
 st.markdown("""
 <div class="hero-banner">
-    <h1>🔬 FabricQA</h1>
+    <h1>Parallel Pipeline FabricQA</h1>
     <p>Upload a fabric image · Get a complete defect report · Structural vs Surface classification</p>
 </div>
 """, unsafe_allow_html=True)
@@ -676,13 +432,6 @@ with tab_inspect:
                                             help="Enable this if uneven lighting is causing false positive defects",
                                             key="shadow_toggle")
 
-        with st.container(border=True):
-            st.markdown("**🖼️ Reference Compare (Golden Image)**")
-            st.caption("Upload a known-good sample for SSIM-based comparison")
-            ref_file = st.file_uploader("Golden image", type=["jpg", "png", "bmp"], key="ref_upload")
-            if ref_file:
-                st.image(ref_file, caption="Golden Reference", width=150)
-
     # ── PROCESS ──
     if img_file is not None:
         orig_img, validation_error = validate_image(img_file)
@@ -697,8 +446,7 @@ with tab_inspect:
                 buf = clone_buffer(img_file)
                 
                 progress.progress(0.2, text="🧠  Routing to detection engines…")
-                ref_buf = clone_buffer(ref_file) if ref_file else None
-                result = unified_processor.process(buf, sensitivity=sensitivity, mode="full", remove_shadows=remove_shadows_ui, ref_buffer=ref_buf)
+                result = unified_processor.process(buf, sensitivity=sensitivity, mode="full", remove_shadows=remove_shadows_ui)
                 
                 progress.progress(0.9, text="📊  Compiling results…")
                 all_defects = result["defects"]
@@ -791,8 +539,6 @@ with tab_inspect:
                     "saliency": "📡 Saliency Map (Spectral+DWT)",
                     "anomaly_heatmap": "📐 Anomaly Heatmap (Edge+Frangi)",
                     "seam_output": "🪡 Seam Detection Output",
-                    "ssim_heatmap": "🖼️ SSIM Deviation Map (Reference)",
-                    "reference_result": "🔍 Reference Compare Result",
                 }
                 for idx, (key, viz_img) in enumerate(map_items):
                     col_idx = idx % len(map_cols)
@@ -835,12 +581,12 @@ with tab_inspect:
                     preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
                     cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred and not c.startswith("bbox")]
                     csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇  Download Full Report (CSV)", csv, "fabricqa_report.csv", mime="text/csv")
+                    st.download_button("⬇  Download Full Report (CSV)", csv, "parallel_pipeline_fabricqa_report.csv", mime="text/csv")
 
                     # PDF Report
                     try:
                         pdf_bytes = generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defects, verdict, s_count, f_count)
-                        st.download_button("📄  Download PDF Report", pdf_bytes, "fabricqa_report.pdf", mime="application/pdf")
+                        st.download_button("📄  Download PDF Report", pdf_bytes, "parallel_pipeline_fabricqa_report.pdf", mime="application/pdf")
                     except Exception:
                         pass  # silently skip if PDF fails
 
