@@ -13,7 +13,9 @@ Detects: Hole, Oil Stain
 import cv2
 import numpy as np
 from typing import Tuple, List, Dict, Any, BinaryIO
+from skimage.filters import threshold_sauvola
 from config import UNIFIED_SETTINGS
+from inspectors.defect_score import compute_severity
 
 class EdgeInspector:
     """Detects Holes and Oil Stains using Adaptive Background Subtraction.
@@ -55,7 +57,8 @@ class EdgeInspector:
         microscopic dark knit holes while preserving massive true anomalies.
         """
         # 1. Light blur to destroy high-frequency knit texture and tiny dark spots
-        img_blur = cv2.GaussianBlur(img_gray, (15, 15), 0)
+        # Kernel larger than individual knit holes (~10-15px) so they are erased.
+        img_blur = cv2.GaussianBlur(img_gray, (25, 25), 0)
         
         # 2. Heavy blur to estimate the macro lighting gradient
         bg = cv2.GaussianBlur(img_gray, (151, 151), 0)
@@ -79,17 +82,25 @@ class EdgeInspector:
         # 1. Subtraction Map
         diff_map = self._compute_background_subtraction(img_gray)
         
-        # 2. Adaptive Threshold
-        # Higher sensitivity = lower threshold (finds more faint stains)
-        mean_diff = np.mean(diff_map)
-        std_diff = np.std(diff_map)
-        
-        # Use a high multiplier because the band-pass difference map suppresses 
-        # tiny knit texture well, but the deep hole is still very pronounced (e.g. 50+).
-        thresh_val = mean_diff + (7.0 - sensitivity) * std_diff
-        thresh_val = max(35, min(thresh_val, 150))
-        
-        _, binary = cv2.threshold(diff_map, thresh_val, 255, cv2.THRESH_BINARY)
+        # Hybrid Thresholding: global noise-floor + Sauvola local adaptation
+        # The global floor kills the noisy baseline that Sauvola alone passes.
+        # Sauvola handles local lighting variation that a global threshold misses.
+        mean_diff = float(np.mean(diff_map))
+        std_diff = float(np.std(diff_map))
+        # Floor multiplier: just enough to cut texture noise, not the defect.
+        # (Original 7.0-sens was for standalone use; now we only need a noise floor.)
+        floor_mult = max(2.0, 4.5 - sensitivity * 0.6)
+        global_floor = mean_diff + floor_mult * std_diff
+        global_floor = max(20, min(global_floor, 120))
+
+        window_size = max(15, int(151 - sensitivity * 28)) | 1  # ensure odd
+        sauvola_k = max(0.05, 0.5 - sensitivity * 0.08)
+        sauvola_thresh = threshold_sauvola(
+            diff_map, window_size=window_size, k=sauvola_k
+        )
+        # Effective threshold = stricter of global floor and local Sauvola
+        effective_thresh = np.maximum(global_floor, sauvola_thresh)
+        binary = ((diff_map > effective_thresh) * 255).astype(np.uint8)
         
         # 3. Morphological Cleanup
         # Close small gaps in holes, then open to remove speckle noise
@@ -145,26 +156,37 @@ class EdgeInspector:
             # Classification
             if is_stain:
                 d_type = "Oil Stain"
-                color = (0, 140, 255) # Orange HTML
+                color = (0, 140, 255)
+            elif aspect_ratio > 3.0 or aspect_ratio < 0.33:
+                d_type = "Tear"
+                color = (0, 0, 255)
             else:
-                # If it's a dark blob without a color shift, it's a physical Hole
                 d_type = "Hole"
-                color = (255, 0, 0) # Blue BGR
+                color = (255, 0, 0)
 
-            # Confidence based on intensity depth
-            roi_diff = diff_map[y:y+h, x:x+w]
-            defect_depth = np.mean(roi_diff) if roi_diff.size > 0 else 1.0
-            confidence = min(99, max(40, int(40 + (defect_depth / 2.5))))
-            
-            if d_type == "Oil Stain":
-                confidence = min(99, int(confidence * 1.2)) # Boost confidence if sat shift confirmed
+            # ── Multi-metric severity scoring ──
+            tmp_defect = {
+                "Type": d_type,
+                "bbox_x": x, "bbox_y": y, "bbox_w": w, "bbox_h": h,
+                "Area (px)": area,
+            }
+            score_result = compute_severity(
+                tmp_defect, img_gray,
+                hsv=img_hsv,
+                deviation_map=diff_map,
+                contour=contour,
+            )
+            severity = score_result["Severity"]
+            score_details = score_result["Score_Details"]
 
             self.defects.append({
                 "ID": 0,
                 "Type": d_type,
                 "Area (px)": real_area,
                 "Solidity": f"{solidity:.2f}",
-                "Confidence": f"{confidence}%",
+                "Confidence": f"{severity}%",
+                "Severity": severity,
+                "Score_Details": score_details,
                 "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh,
                 "Category": "Surface" if d_type == "Oil Stain" else "Structural",
                 "Group": "Fabric Structure",

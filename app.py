@@ -33,13 +33,31 @@ GROUP_II_TYPES = {
     "Skip Stitch", "Broken Stitch", "Run-off Stitch",
     "Crooked Stitch", "Pucker",
 }
-# Structural = physically damaging; Surface = visual/textural
+# Structural = physically damaging (fabric integrity); Surface = visual/cosmetic
 STRUCTURAL_TYPES = {
-    "Missing Thread", "Hole", "Tear", "Snag",
-    "Skip Stitch", "Broken Stitch", "Run-off Stitch", "Crooked Stitch",
+    "Hole", "Tear", "Missing Thread",
+    "Skip Stitch", "Broken Stitch",
 }
 SURFACE_TYPES = {
-    "Slub", "Oil Stain", "Pucker",
+    "Slub", "Snag", "Oil Stain",
+    "Run-off Stitch", "Crooked Stitch", "Pucker",
+}
+
+# Consistent color palette per defect type (BGR)
+DEFECT_COLORS = {
+    # Structural (red family)
+    "Hole":           (60, 60, 255),
+    "Tear":           (50, 50, 220),
+    "Missing Thread": (80, 80, 240),
+    "Skip Stitch":    (70, 70, 230),
+    "Broken Stitch":  (90, 90, 250),
+    # Surface (amber/yellow family)
+    "Slub":           (30, 180, 255),
+    "Snag":           (50, 160, 240),
+    "Oil Stain":      (20, 140, 220),
+    "Run-off Stitch": (40, 170, 250),
+    "Crooked Stitch": (60, 190, 250),
+    "Pucker":         (10, 150, 230),
 }
 
 def classify_defect(defect_type: str) -> str:
@@ -50,7 +68,7 @@ def classify_defect(defect_type: str) -> str:
         return "Surface"
     # fallback heuristic
     low = defect_type.lower()
-    if any(k in low for k in ("tear", "hole", "cut", "stitch", "break", "weave", "thread", "snag")):
+    if any(k in low for k in ("tear", "hole", "break", "thread", "skip")):
         return "Structural"
     return "Surface"
 
@@ -329,12 +347,14 @@ def deduplicate_defects(defects, iou_threshold=0.5):
     """Remove overlapping defects using Non-Maximum Suppression.
     
     When two defect boxes overlap >= iou_threshold, the one with
-    lower confidence is dropped.
+    lower severity is dropped.
     """
     if len(defects) <= 1:
         return defects
 
     def _conf(d):
+        if "Severity" in d:
+            return int(d["Severity"])
         c = d.get("Confidence", "0%")
         try: return int(str(c).replace("%", "").strip())
         except: return 0
@@ -440,7 +460,7 @@ def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defec
             pdf.ln(3)
 
             # Table header
-            headers = ["#", "Category", "Type", "Area (px)", "Confidence"]
+            headers = ["#", "Category", "Type", "Area (px)", "Severity"]
             col_w = [10, 30, 50, 25, 25]
             pdf.set_font("Helvetica", "B", 9)
             pdf.set_fill_color(240, 240, 240)
@@ -455,7 +475,8 @@ def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defec
                 pdf.cell(col_w[1], 6, d.get("Category", ""), border=1)
                 pdf.cell(col_w[2], 6, d.get("Type", "")[:30], border=1)
                 pdf.cell(col_w[3], 6, str(d.get("Area (px)", "")), border=1)
-                pdf.cell(col_w[4], 6, str(d.get("Confidence", "")), border=1)
+                sev_str = str(d.get("Severity", d.get("Confidence", "")))
+                pdf.cell(col_w[4], 6, sev_str, border=1)
                 pdf.ln()
 
         return pdf.output()
@@ -615,8 +636,14 @@ def draw_category_overlay(base_img, defects, color_bgr, label_prefix):
 
         # Label tag above box
         lbl = d.get("Type", "Defect")
+        sev = d.get("Severity", "")
         conf = d.get("Confidence", "")
-        tag = f"{lbl} ({conf})" if conf else lbl
+        if sev:
+            tag = f"{lbl} (S:{sev})"
+        elif conf:
+            tag = f"{lbl} ({conf})"
+        else:
+            tag = lbl
 
         font_scale = max(0.4, min(0.7, bw / 200))
         thickness = 1 if font_scale < 0.55 else 2
@@ -628,6 +655,76 @@ def draw_category_overlay(base_img, defects, color_bgr, label_prefix):
         cv2.putText(overlay, tag, (x1 + 3, ty),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
+    return overlay
+
+
+def draw_unified_overlay(base_img, all_defects):
+    """Draw ALL defects on ONE image, color-coded by category.
+
+    Structural defects → red, Surface defects → amber/yellow.
+    Adds a legend strip at the top.
+    """
+    overlay = base_img.copy()
+    img_h, img_w = overlay.shape[:2]
+
+    STRUCTURAL_CLR = (113, 113, 248)  # red-ish BGR
+    SURFACE_CLR    = (36, 191, 251)   # amber BGR
+
+    for d in all_defects:
+        bx = d.get("bbox_x")
+        by = d.get("bbox_y")
+        bw = d.get("bbox_w")
+        bh = d.get("bbox_h")
+        if bx is None or by is None or bw is None or bh is None:
+            continue
+
+        x1 = max(0, int(bx))
+        y1 = max(0, int(by))
+        x2 = min(img_w, int(bx + bw))
+        y2 = min(img_h, int(by + bh))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        cat = d.get("Category", classify_defect(d.get("Type", "")))
+        color = STRUCTURAL_CLR if cat == "Structural" else SURFACE_CLR
+
+        # Per-type color from palette (if available)
+        dtype = d.get("Type", "")
+        color = DEFECT_COLORS.get(dtype, color)
+
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 3)
+
+        # Semi-transparent fill for small/medium boxes
+        box_area = (x2 - x1) * (y2 - y1)
+        if box_area < img_h * img_w * 0.15:
+            sub = overlay[y1:y2, x1:x2]
+            if sub.size > 0:
+                fill = np.full_like(sub, color, dtype=np.uint8)
+                cv2.addWeighted(fill, 0.18, sub, 0.82, 0, sub)
+
+        # Label
+        sev = d.get("Severity", "")
+        tag = f"{dtype} S:{sev}" if sev else dtype
+        font_scale = max(0.38, min(0.65, bw / 220))
+        thickness = 1 if font_scale < 0.55 else 2
+        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        ty = max(y1 - 6, th + 4)
+        cv2.rectangle(overlay, (x1, ty - th - 4), (x1 + tw + 6, ty + 4), color, -1)
+        cv2.putText(overlay, tag, (x1 + 3, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # ── Legend bar at bottom ──
+    legend_h = 32
+    legend = np.zeros((legend_h, img_w, 3), dtype=np.uint8)
+    legend[:] = (30, 30, 30)  # dark strip
+    # Structural legend swatch
+    cv2.rectangle(legend, (10, 6), (26, 22), STRUCTURAL_CLR, -1)
+    cv2.putText(legend, "Structural", (30, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    # Surface legend swatch
+    cv2.rectangle(legend, (160, 6), (176, 22), SURFACE_CLR, -1)
+    cv2.putText(legend, "Surface", (180, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+    overlay = np.vstack([overlay, legend])
     return overlay
 
 
@@ -669,8 +766,8 @@ with tab_inspect:
             sensitivity = st.slider("Detection sensitivity", 1.0, 5.0, 2.5, 0.1,
                                     help="Higher = more sensitive, may produce false positives",
                                     key="sens_slider")
-            conf_threshold = st.slider("Confidence threshold (%)", 0, 80, 30, 5,
-                                       help="Defects below this confidence are filtered out",
+            conf_threshold = st.slider("Severity threshold", 0, 80, 30, 5,
+                                       help="Defects below this severity score are filtered out",
                                        key="conf_slider")
             remove_shadows_ui = st.checkbox("Remove Shadows (Illumination Correction)", value=False,
                                             help="Enable this if uneven lighting is causing false positive defects",
@@ -711,8 +808,10 @@ with tab_inspect:
                 for d in all_defects:
                     d["Category"] = classify_defect(d.get("Type", ""))
 
-                # Parse confidence string "42%" → 42, filter below threshold
+                # Parse severity score, filter below threshold
                 def _conf_val(d):
+                    if "Severity" in d:
+                        return int(d["Severity"])
                     c = d.get("Confidence", "0%")
                     try: return int(str(c).replace("%", "").strip())
                     except: return 0
@@ -721,15 +820,9 @@ with tab_inspect:
 
                 # Deduplication is handled upstream by unified_processor._nms
 
-                # Group defects for UI display
-                # Note: From the taxonomy, Group I is "Fabric Structure" (Hole, Tear, Missing Thread, Slub, Snag, Oil Stain).
-                # Wait, "Surface" vs "Structural" was the old taxonomy.
-                # Let's cleanly split them based on the Types. 
-                # Structural: Hole, Tear, Missing Thread, Snag, plus all Stitch defects.
-                # Surface: Slub, Oil Stain.
-                struc_types = {"Hole", "Tear", "Snag", "Missing Thread", "Skip Stitch", "Broken Stitch", "Run-off Stitch", "Crooked Stitch", "Pucker"}
-                structural = [d for d in all_defects if d.get("Type") in struc_types]
-                surface = [d for d in all_defects if d not in structural]
+                # Group defects by category for display
+                structural = [d for d in all_defects if d.get("Category") == "Structural"]
+                surface    = [d for d in all_defects if d.get("Category") == "Surface"]
 
                 s_count = len(structural)
                 f_count = len(surface)
@@ -756,7 +849,7 @@ with tab_inspect:
                 </div>
                 """, unsafe_allow_html=True)
 
-                # ── VISUAL RESULTS: Original · Structural · Surface ──
+                # ── VISUAL RESULTS: Unified annotated image ──
                 st.markdown('<div class="sec-title">Visual Results</div>', unsafe_allow_html=True)
 
                 base_img = decode_image(img_file)
@@ -768,15 +861,15 @@ with tab_inspect:
                 with c1:
                     with st.container(border=True):
                         st.caption("📷  Original")
-                        st.image(base_img, channels="BGR", width="stretch")
+                        st.image(base_img, channels="BGR", use_container_width=True)
                 with c2:
                     with st.container(border=True):
                         st.caption(f"🔴  Structural Defects ({s_count})")
-                        st.image(structural_overlay, channels="BGR", width="stretch")
+                        st.image(structural_overlay, channels="BGR", use_container_width=True)
                 with c3:
                     with st.container(border=True):
                         st.caption(f"🟡  Surface Defects ({f_count})")
-                        st.image(surface_overlay, channels="BGR", width="stretch")
+                        st.image(surface_overlay, channels="BGR", use_container_width=True)
 
                 # ── BEFORE / AFTER COMPARISON ──
                 if total > 0:
@@ -823,23 +916,36 @@ with tab_inspect:
                     if structural:
                         st.markdown('<div class="cat-hdr cat-structural">🔴  Structural Defects — Physical Damage</div>', unsafe_allow_html=True)
                         df_s = pd.DataFrame(structural)
-                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
-                        cols_order = [c for c in preferred if c in df_s.columns] + [c for c in df_s.columns if c not in preferred and not c.startswith("bbox")]
+                        preferred = ["Category", "Group", "Engine", "Type", "Area (px)", "Solidity", "Severity", "Confidence", "Location"]
+                        cols_order = [c for c in preferred if c in df_s.columns] + [c for c in df_s.columns if c not in preferred and not c.startswith("bbox") and c != "Score_Details"]
                         with st.container(border=True):
                             st.dataframe(df_s[cols_order], width="stretch")
+                            # Expandable score breakdown
+                            with st.expander("Score Breakdown (per-metric details)"):
+                                for idx, d in enumerate(structural):
+                                    sd = d.get("Score_Details", {})
+                                    if sd:
+                                        st.caption(f"**{d.get('Type', '')}** @ ({d.get('bbox_x',0)},{d.get('bbox_y',0)})")
+                                        st.json(sd)
 
                     if surface:
                         st.markdown('<div class="cat-hdr cat-surface">🟡  Surface Defects — Visual / Textural</div>', unsafe_allow_html=True)
                         df_f = pd.DataFrame(surface)
-                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
-                        cols_order = [c for c in preferred if c in df_f.columns] + [c for c in df_f.columns if c not in preferred and not c.startswith("bbox")]
+                        preferred = ["Category", "Group", "Engine", "Type", "Area (px)", "Solidity", "Severity", "Confidence", "Location"]
+                        cols_order = [c for c in preferred if c in df_f.columns] + [c for c in df_f.columns if c not in preferred and not c.startswith("bbox") and c != "Score_Details"]
                         with st.container(border=True):
                             st.dataframe(df_f[cols_order], width="stretch")
+                            with st.expander("Score Breakdown (per-metric details)"):
+                                for idx, d in enumerate(surface):
+                                    sd = d.get("Score_Details", {})
+                                    if sd:
+                                        st.caption(f"**{d.get('Type', '')}** @ ({d.get('bbox_x',0)},{d.get('bbox_y',0)})")
+                                        st.json(sd)
 
                     # Combined download
                     df_all = pd.DataFrame(all_defects)
-                    preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
-                    cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred and not c.startswith("bbox")]
+                    preferred = ["Category", "Group", "Engine", "Type", "Area (px)", "Solidity", "Severity", "Confidence", "Location"]
+                    cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred and not c.startswith("bbox") and c != "Score_Details"]
                     csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
                     st.download_button("⬇  Download Full Report (CSV)", csv, "fabricqa_report.csv", mime="text/csv")
 
@@ -857,7 +963,8 @@ with tab_inspect:
                     for i, d in enumerate(all_defects[:20]):
                         col_desc, col_btn = st.columns([4, 1])
                         with col_desc:
-                            st.text(f"{d.get('Type', 'Unknown')} | {d.get('Confidence', '')} | {d.get('Inspector', '')}")
+                            sev_txt = d.get("Severity", d.get("Confidence", ""))
+                            st.text(f"{d.get('Type', 'Unknown')} | Severity: {sev_txt} | {d.get('Engine', d.get('Inspector', ''))}")
                         with col_btn:
                             if st.button("❌ False Positive", key=f"fb_{i}"):
                                 save_feedback({
@@ -973,7 +1080,7 @@ with tab_batch:
 
         if all_batch_defects:
             df_all = pd.DataFrame(all_batch_defects)
-            preferred = ["Filename", "Category", "Type", "Confidence"]
+            preferred = ["Filename", "Category", "Type", "Severity", "Confidence"]
             cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred]
             csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
             st.download_button("⬇  Download Batch Report", csv, "batch_report.csv", mime="text/csv")

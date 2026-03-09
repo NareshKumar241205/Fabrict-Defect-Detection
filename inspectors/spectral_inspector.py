@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from typing import Tuple, List, Dict, Any, BinaryIO
 from config import UNIFIED_SETTINGS
+from inspectors.defect_score import compute_severity
 
 class SpectralInspector:
     """Detects directional line defects using Gabor filter banks.
@@ -129,36 +130,42 @@ class SpectralInspector:
             real_area = max(1, int(area / (scale**2)))
 
             # Classification
-            # Missing threads are highly elongated lines
             if aspect_ratio > 4.0 or aspect_ratio < 0.25:
                 d_type = "Missing Thread"
-                color = (0, 0, 255)  # Red BGR
-            # Snags are smaller, intense local protrusions
+                color = (0, 0, 255)
             elif real_area < UNIFIED_SETTINGS.get("SNAG_AREA_MAX", 600):
                 d_type = "Snag"
-                color = (255, 105, 180)  # Hot Pink
+                color = (255, 105, 180)
             else:
-                # If it doesn't fit the directional anomaly profile, skip it to let 
-                # Template/SSIM inspector handle it
-                continue
+                d_type = "Slub"
+                color = (0, 165, 255)
 
-            # Calculate confidence based on Gabor spike intensity vs background
-            roi_gabor = gabor_response[y:y+h, x:x+w]
-            spike_val = np.mean(roi_gabor) if roi_gabor.size > 0 else 0
-            bg_val = np.mean(blur[y:y+h, x:x+w]) if roi_gabor.size > 0 else 1
-            ratio = (spike_val / max(bg_val, 1))
-            
-            # Bound confidence 40-99%
-            confidence = min(99, max(40, int((ratio * 20))))
+            # ── Multi-metric severity scoring ──
+            tmp_defect = {
+                "Type": d_type,
+                "bbox_x": x, "bbox_y": y, "bbox_w": w, "bbox_h": h,
+                "Area (px)": area,
+            }
+            hsv_small = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
+            score_result = compute_severity(
+                tmp_defect, img_gray,
+                hsv=hsv_small,
+                deviation_map=gabor_response,
+                contour=contour,
+            )
+            severity = score_result["Severity"]
+            score_details = score_result["Score_Details"]
 
             self.defects.append({
                 "ID": 0,
                 "Type": d_type,
                 "Area (px)": real_area,
                 "Solidity": f"{solidity:.2f}",
-                "Confidence": f"{confidence}%",
+                "Confidence": f"{severity}%",
+                "Severity": severity,
+                "Score_Details": score_details,
                 "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh,
-                "Category": "Structural",
+                "Category": "Structural" if d_type == "Missing Thread" else "Surface",
                 "Group": "Fabric Structure",
                 "Engine": "Gabor Frequency Map"
             })

@@ -47,7 +47,7 @@ SEAM_SETTINGS = {
     "PUCKER_VAR_SIGMA": 1.5,       # Tightened from 2.0 → catch puckers earlier
     "RUNOFF_EDGE_MARGIN": 0.08,    # Tightened from 0.10 → narrower edge check
     "BROKEN_GAP_MIN": 15,          # Lowered from 20 → catch broken stitches sooner
-    "MIN_CENTROID_COUNT": 15,      # Lowered from 20 → detect partial seams
+    "MIN_CENTROID_COUNT": 10,      # Lowered from 15 → detect partial seams
     "CENTER_DENSITY_MIN": 8,       # Min center density to trigger run-off check
     "RUNOFF_DENSITY_RATIO": 0.35,  # Edge must be < 35% of center to be a run-off
 }
@@ -87,9 +87,13 @@ UNIFIED_SETTINGS = {
     "OIL_STAIN_SOLIDITY_MIN": 0.80,   # Lowered from 0.85 → catch less-round stains
     "TEAR_ASPECT_RATIO_MIN": 3.0,
     "SNAG_AREA_MAX": 600,             # Lowered from 800 → snags are small
-    "HOLE_AREA_MIN": 800,             # Lowered from 1000 → catch smaller holes
+    "HOLE_AREA_MIN": 1500,             # Raised → filter tiny knit-pattern noise from Edge Inspector
     "BROKEN_GAP_MIN": 15,
 
     "MAX_BOX_AREA_RATIO": 0.22,       # Max bbox area as fraction of image (reduced from 0.25)
     "MIN_SOLIDITY": 0.08,             # Discard extremely jagged noise contours
+
+    # Photometric & Gradient Rule Engine thresholds (Task 2)
+    "FP_MIN_CONTRAST": 0.05,          # Min local contrast ratio (defect vs neighbourhood)
+    "FP_MIN_GRADIENT": 8.0,           # Min mean Sobel gradient magnitude inside bbox
 }

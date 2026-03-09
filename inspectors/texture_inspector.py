@@ -14,7 +14,9 @@ import cv2
 import numpy as np
 import logging
 from typing import Tuple, List, Dict, Any, BinaryIO
+from skimage.filters import threshold_sauvola
 from config import UNIFIED_SETTINGS
+from inspectors.defect_score import compute_severity
 
 logger = logging.getLogger(__name__)
 
@@ -51,37 +53,68 @@ class TextureInspector:
         return img, img_small, img_gray, scale
 
     def _compute_texture_deviation(self, img_gray: np.ndarray) -> np.ndarray:
-        """Finds texture anomalies by mathematically erasing the knitting pattern.
-        Knitted fabric has thousands of tiny holes and slubs (the stitches).
-        By Morphologically Closing (filling dark knit holes) and Opening (crushing bright
-        knit slubs) with a kernel slightly larger than the stitch size, we create a perfectly
-        flat fabric baseline where ONLY massive true defects survive.
+        """True Normalized Cross-Correlation (NCC) based deviation map.
+
+        1. Auto-extracts a clean 64×64 reference patch (region with the
+           lowest local variance — assumed defect-free fabric).
+        2. Slides the patch across the entire image using
+           cv2.matchTemplate(TM_CCOEFF_NORMED).
+        3. Returns a uint8 deviation map where HIGH values = LOW correlation
+           (structural anomalies).
         """
-        # 1. Erase knitting pattern
-        # The 15x15 kernel is precisely tuned to be larger than a single knit stitch,
-        # perfectly filling the gaps and flattening the threads without erasing true defects.
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        
-        # Fill all tiny dark knit gaps
-        closed = cv2.morphologyEx(img_gray, cv2.MORPH_CLOSE, k)
-        
-        # Crush all tiny bright knit highlights
-        flat_fabric = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k)
-        
-        # 2. Extract true anomalies
-        # Calculate the global average color of this perfectly flat fabric
-        mean_val = np.mean(flat_fabric)
-        
-        # Dark anomalies (Holes/Tears)
-        diff_dark = cv2.subtract(mean_val, flat_fabric)
-        
-        # Bright anomalies (Massive Slubs)
-        diff_bright = cv2.subtract(flat_fabric, mean_val)
-        
-        # Combine into a single distance map
-        combined = cv2.addWeighted(diff_dark, 1.0, diff_bright, 1.0, 0)
-        
-        return combined
+        patch_size = self.PATCH_SIZE  # 64
+        h, w = img_gray.shape[:2]
+
+        if h < patch_size * 2 or w < patch_size * 2:
+            return np.zeros((h, w), dtype=np.uint8)
+
+        # ── Step 1: find the cleanest patch (lowest local variance) ──
+        # Guard: only consider patches whose mean is close to the image
+        # global mean — this prevents selecting a dark defect hole
+        # (which has low variance but anomalous intensity) as "clean".
+        step = patch_size // 2
+        best_var = float('inf')
+        best_patch = None
+
+        global_mean = float(np.mean(img_gray))
+        global_std = float(np.std(img_gray))
+        mean_lo = global_mean - 1.5 * global_std
+        mean_hi = global_mean + 1.5 * global_std
+
+        for y in range(0, h - patch_size, step):
+            for x in range(0, w - patch_size, step):
+                patch = img_gray[y:y + patch_size, x:x + patch_size]
+                patch_mean = float(np.mean(patch))
+                # Reject patches with anomalous intensity (defect regions)
+                if patch_mean < mean_lo or patch_mean > mean_hi:
+                    continue
+                local_var = float(np.var(patch.astype(np.float32)))
+                # Reject near-constant patches (blank/background) with var < 1
+                if 1.0 < local_var < best_var:
+                    best_var = local_var
+                    best_patch = patch.copy()
+
+        if best_patch is None:
+            return np.zeros((h, w), dtype=np.uint8)
+
+        # ── Step 2: NCC sliding-window ──
+        ncc_map = cv2.matchTemplate(
+            img_gray, best_patch, cv2.TM_CCOEFF_NORMED
+        )  # float32 in [-1, 1], shape = (h-ps+1, w-ps+1)
+
+        # ── Step 3: correlation → deviation (invert and scale to 0-255) ──
+        deviation = 1.0 - ncc_map          # high where correlation is low
+        deviation = np.clip(deviation, 0, 2)
+        deviation = (deviation / 2.0 * 255).astype(np.uint8)
+
+        # Pad back to original image dimensions (matchTemplate shrinks)
+        pad_y = patch_size // 2
+        pad_x = patch_size // 2
+        dh, dw = deviation.shape[:2]
+        deviation_full = np.zeros((h, w), dtype=np.uint8)
+        deviation_full[pad_y:pad_y + dh, pad_x:pad_x + dw] = deviation
+
+        return deviation_full
 
     def process(
         self,
@@ -95,18 +128,23 @@ class TextureInspector:
         # Compute texture deviation map
         dist_map = self._compute_texture_deviation(img_gray)
         
-        # Calculate dynamic threshold based on sensitivity
-        # High sensitivity = lower multiplier
-        mean_dist = np.mean(dist_map)
-        std_dist = np.std(dist_map)
-        
-        # Because the knit pattern is mathematically erased, the noise floor is extremely low.
-        # We can use a lower standard deviation multiplier and target tight isolation.
+        # Hybrid Thresholding: global noise-floor + Sauvola local adaptation
+        # The global floor kills the noisy baseline that Sauvola alone passes.
+        # Sauvola handles local lighting variation that a global threshold misses.
+        mean_dist = float(np.mean(dist_map))
+        std_dist = float(np.std(dist_map))
         mult = max(1.0, 4.0 - (sensitivity * 0.5))
-        thresh_val = mean_dist + (mult * std_dist)
-        thresh_val = max(25, min(thresh_val, 150))
-        
-        _, binary = cv2.threshold(dist_map, thresh_val, 255, cv2.THRESH_BINARY)
+        global_floor = mean_dist + mult * std_dist
+        global_floor = max(25, min(global_floor, 150))
+
+        window_size = max(15, int(151 - sensitivity * 28)) | 1  # ensure odd
+        sauvola_k = max(0.05, 0.5 - sensitivity * 0.08)
+        sauvola_thresh = threshold_sauvola(
+            dist_map, window_size=window_size, k=sauvola_k
+        )
+        # Effective threshold = stricter of global floor and local Sauvola
+        effective_thresh = np.maximum(global_floor, sauvola_thresh)
+        binary = ((dist_map > effective_thresh) * 255).astype(np.uint8)
         
         # Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
@@ -152,38 +190,45 @@ class TextureInspector:
             
             # Classification
             if aspect_ratio > 3.0 or aspect_ratio < 0.33:
-                # Elongated severe SSIM drop = Tear or massive snag line
                 d_type = "Tear"
-                color = (0, 0, 255) # Red
+                color = (0, 0, 255)
             elif defect_gray_mean < global_gray_mean * 0.80:
-                # If the anomaly is significantly darker than the fabric baseline, it's a Hole
                 d_type = "Hole"
-                color = (255, 0, 0) # Blue
+                color = (255, 0, 0)
             elif solidity > 0.4:
-                # Solid cluster = Thick Slub
                 d_type = "Slub"
-                color = (0, 165, 255) # Orange
+                color = (0, 165, 255)
             else:
-                # Irregular messy break
                 d_type = "Slub"
-                color = (255, 0, 255) # Magenta
-                
-            # Confidence based on intensity of texture deviation
-            roi_dist = dist_map[y:y+h, x:x+w]
-            defect_dist_max = np.max(roi_dist) if roi_dist.size > 0 else 0
-            
-            # The stronger the deviation peak, the higher the confidence
-            # Threshold is around 30-60, severe defects hit 120-255
-            confidence = min(99, max(40, int((defect_dist_max / 255.0) * 100) + 20))
+                color = (255, 0, 255)
+
+            # ── Multi-metric severity scoring ──
+            # Build a temporary defect dict for the scorer (processing coords)
+            tmp_defect = {
+                "Type": d_type,
+                "bbox_x": x, "bbox_y": y, "bbox_w": w, "bbox_h": h,
+                "Area (px)": area,
+            }
+            hsv_small = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
+            score_result = compute_severity(
+                tmp_defect, img_gray,
+                hsv=hsv_small,
+                deviation_map=dist_map,
+                contour=contour,
+            )
+            severity = score_result["Severity"]
+            score_details = score_result["Score_Details"]
 
             self.defects.append({
                 "ID": 0,
                 "Type": d_type,
                 "Area (px)": real_area,
                 "Solidity": f"{solidity:.2f}",
-                "Confidence": f"{confidence}%",
+                "Confidence": f"{severity}%",
+                "Severity": severity,
+                "Score_Details": score_details,
                 "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh,
-                "Category": "Structural",
+                "Category": "Structural" if d_type in ("Hole", "Tear", "Missing Thread") else "Surface",
                 "Group": "Fabric Structure",
                 "Engine": "Adaptive Texture Analysis"
             })

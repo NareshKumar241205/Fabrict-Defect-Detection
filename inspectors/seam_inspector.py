@@ -20,6 +20,7 @@ import numpy as np
 import logging
 from typing import Tuple, List, Dict, Any, BinaryIO, Optional
 from config import SEAM_SETTINGS
+from inspectors.defect_score import compute_seam_severity
 
 logger = logging.getLogger(__name__)
 
@@ -63,36 +64,14 @@ class SeamInspector:
         return img, img_small, img_gray, scale
 
     # ──────────────────────────────────────────
-    # Deskew — FIX: use MEDIAN angle of all near-horizontal lines
+    # Deskew — delegates to the canonical implementation in
+    # UnifiedProcessor._deskew so both share the same algorithm.
+    # Kept as a thin wrapper for SeamInspector's internal use.
     # ──────────────────────────────────────────
-    def _deskew(self, img_gray: np.ndarray) -> Tuple[np.ndarray, float]:
-        edges = cv2.Canny(img_gray, 50, 150)
-        lines = cv2.HoughLinesP(
-            edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=20
-        )
-
-        if lines is None or len(lines) == 0:
-            return img_gray, 0.0
-
-        # Collect angles of all near-horizontal lines
-        angles: List[float] = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-            if abs(angle) < 45 and abs(angle) > 0.5:
-                angles.append(angle)
-
-        if not angles:
-            return img_gray, 0.0
-
-        # Use median angle for robustness against outlier lines
-        median_angle = float(np.median(angles))
-        center = (img_gray.shape[1] // 2, img_gray.shape[0] // 2)
-        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-        rot_img = cv2.warpAffine(
-            img_gray, M, (img_gray.shape[1], img_gray.shape[0])
-        )
-        return rot_img, median_angle
+    @staticmethod
+    def _deskew(img_gray: np.ndarray) -> Tuple[np.ndarray, float]:
+        from inspectors.unified_processor import UnifiedProcessor
+        return UnifiedProcessor._deskew(img_gray)
 
     # ──────────────────────────────────────────
     # Adaptive stitch mask — FIX: handle both bright and dark threads
@@ -100,40 +79,107 @@ class SeamInspector:
     def _extract_stitch_mask(
         self, rot_img: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Threshold the thread using whichever polarity (bright/dark) yields
-        more stitch-like pixels. Bright threads on dark fabric use a high
-        threshold; dark threads on light fabric use an inverted low threshold.
+        """Extract stitch mask focused on the seam region.
+
+        Strategy:
+          1. Find seam band via Canny edge-row density peak — the seam has
+             the highest concentration of edge pixels per row.
+          2. Crop a narrow band (±12 % of image height) around the peak.
+          3. Within the band use CLAHE + Otsu adaptive thresholding — this
+             adapts to any fabric brightness level.
+          4. Morphological clean-up: close small gaps, remove isolated noise.
+          5. Dual polarity: pick whichever (bright/dark threshold) gives a
+             sparser, more stitch-like mask.
         """
-        # Bright thread mask (original behaviour)
-        _, mask_bright = cv2.threshold(
-            rot_img, self.stitch_thresh, 255, cv2.THRESH_BINARY
-        )
-        bright_count = np.count_nonzero(mask_bright)
+        h, w = rot_img.shape[:2]
 
-        # Dark thread mask (inverted)
-        dark_thresh = 255 - self.stitch_thresh
-        _, mask_dark = cv2.threshold(
-            rot_img, dark_thresh, 255, cv2.THRESH_BINARY_INV
-        )
-        dark_count = np.count_nonzero(mask_dark)
+        # ── Step 1: Locate seam band via Canny edge-row density ──
+        edges = cv2.Canny(rot_img, 50, 150)
+        row_edge_count = np.sum(edges > 0, axis=1).astype(np.float64)
 
-        # Pick whichever gives a reasonable stitch signal (but not the whole image)
-        img_pixels = rot_img.shape[0] * rot_img.shape[1]
-        b_ratio = bright_count / max(img_pixels, 1)
-        d_ratio = dark_count / max(img_pixels, 1)
+        # Smooth
+        k = max(5, h // 30)
+        kernel = np.ones(k) / k
+        row_smooth = np.convolve(row_edge_count, kernel, mode='same')
 
-        # A real stitch covers roughly 1-40 % of the image
-        def _valid(r: float) -> bool:
-            return 0.01 < r < 0.40
+        # Find the peak region — use top-percentile rows
+        # The seam is a horizontal band; take peak ± 12% margin
+        peak_row = int(np.argmax(row_smooth))
+        band_half = max(40, int(h * 0.12))
+        band_top = max(0, peak_row - band_half)
+        band_bot = min(h, peak_row + band_half)
 
-        if _valid(b_ratio) and (not _valid(d_ratio) or b_ratio < d_ratio):
-            thread_mask = mask_bright
-        elif _valid(d_ratio):
-            thread_mask = mask_dark
-        elif bright_count > 0:
-            thread_mask = mask_bright
+        # Verify peak is meaningfully above background
+        peak_val = row_smooth[peak_row]
+        bg_rows = np.concatenate([row_smooth[:max(1, band_top)],
+                                   row_smooth[min(h - 1, band_bot):]])
+        if len(bg_rows) > 0:
+            bg_mean = float(np.mean(bg_rows))
         else:
-            thread_mask = mask_dark
+            bg_mean = float(np.mean(row_smooth))
+
+        # If peak isn't at least 10% above background, use wider band
+        if peak_val < bg_mean * 1.10:
+            band_half = max(60, int(h * 0.20))
+            band_top = max(0, peak_row - band_half)
+            band_bot = min(h, peak_row + band_half)
+
+        band_img = rot_img[band_top:band_bot, :]
+
+        # ── Step 2: Adaptive threshold within band ──
+        # CLAHE to normalize local contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        band_eq = clahe.apply(band_img)
+
+        # Otsu on the equalized band — adapts to fabric brightness
+        otsu_val, _ = cv2.threshold(band_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Bright thread: above Otsu
+        _, mask_bright = cv2.threshold(band_eq, otsu_val, 255, cv2.THRESH_BINARY)
+        # Dark thread: below Otsu
+        _, mask_dark = cv2.threshold(band_eq, otsu_val, 255, cv2.THRESH_BINARY_INV)
+
+        # ── Step 3: Morphological cleanup ──
+        # Close small gaps in thread, remove isolated dots
+        morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        mask_bright = cv2.morphologyEx(mask_bright, cv2.MORPH_CLOSE, morph_kernel)
+        mask_dark = cv2.morphologyEx(mask_dark, cv2.MORPH_CLOSE, morph_kernel)
+
+        # Remove small components (noise)
+        def _clean(mask: np.ndarray, min_area: int = 50) -> np.ndarray:
+            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+            clean = np.zeros_like(mask)
+            for i in range(1, n_labels):
+                if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                    clean[labels == i] = 255
+            return clean
+
+        mask_bright = _clean(mask_bright)
+        mask_dark = _clean(mask_dark)
+
+        # ── Step 4: Pick the sparser (more stitch-like) mask ──
+        band_pixels = max(band_img.shape[0] * band_img.shape[1], 1)
+        b_ratio = np.count_nonzero(mask_bright) / band_pixels
+        d_ratio = np.count_nonzero(mask_dark) / band_pixels
+
+        def _valid(r: float) -> bool:
+            return 0.005 < r < 0.50
+
+        if _valid(b_ratio) and _valid(d_ratio):
+            # Pick the sparser one — stitch is the minority
+            band_mask = mask_bright if b_ratio < d_ratio else mask_dark
+        elif _valid(b_ratio):
+            band_mask = mask_bright
+        elif _valid(d_ratio):
+            band_mask = mask_dark
+        elif np.count_nonzero(mask_bright) > 0:
+            band_mask = mask_bright
+        else:
+            band_mask = mask_dark
+
+        # ── Step 5: Place into full-size mask ──
+        thread_mask = np.zeros((h, w), dtype=np.uint8)
+        thread_mask[band_top:band_bot, :] = band_mask
 
         proj = np.sum(thread_mask, axis=0) / 255.0
         return thread_mask, proj
@@ -171,6 +217,7 @@ class SeamInspector:
                             "w": gap_counter, "h": h - 20,
                             "type": d_type,
                             "score": gap_counter,
+                            "_raw_metrics": {"gap_width": gap_counter},
                         })
                     in_gap = False
                     gap_counter = 0
@@ -189,6 +236,7 @@ class SeamInspector:
                         "w": edge_margin, "h": h - 20,
                         "type": "Run-off Stitch",
                         "score": int((1.0 - (left_density / center_density)) * 100),
+                        "_raw_metrics": {"density_ratio": left_density / max(center_density, 1e-6)},
                     })
 
                 right_density = np.mean(smooth_proj[-edge_margin:])
@@ -198,6 +246,7 @@ class SeamInspector:
                         "w": edge_margin, "h": h - 20,
                         "type": "Run-off Stitch",
                         "score": int((1.0 - (right_density / center_density)) * 100),
+                        "_raw_metrics": {"density_ratio": right_density / max(center_density, 1e-6)},
                     })
         return defects
 
@@ -215,9 +264,13 @@ class SeamInspector:
         for x in range(0, w, step):
             col = thread_mask[:, x]
             stitch_pixels = np.where(col > 0)[0]
-            if len(stitch_pixels) > 5:
-                centroids_y.append(float(np.mean(stitch_pixels)))
-                centroids_x.append(float(x))
+            if len(stitch_pixels) > 2:
+                # Only count if stitch pixels are clustered (not scattered fabric noise)
+                # A real stitch column has a Y range smaller than ~55 % of image height
+                sp_range = float(stitch_pixels[-1] - stitch_pixels[0])
+                if sp_range < h * 0.55:
+                    centroids_y.append(float(np.mean(stitch_pixels)))
+                    centroids_x.append(float(x))
 
         if len(centroids_x) < self.min_centroid_count:
             return defects
@@ -229,15 +282,16 @@ class SeamInspector:
         # A real seam runs in a NARROW horizontal band — stitch centroids cluster
         # close together in Y.  A knit/fabric pattern has pixels spread across
         # the full image height → large Y-spread.
-        # If Y span > 35% of image height → fabric pattern, NOT a seam.
+        # Relaxed to 0.50.  Real seam images show 36-48% spread;
+        # pure fabric patterns are typically >55%.
         y_spread = float(np.max(cy) - np.min(cy))
-        if y_spread > h * 0.35:
+        if y_spread > h * 0.50:
             return defects
 
         # ── GUARD 2: X-span check ────────────────────────────────────────────
-        # A real seam crosses at least 40% of the image width.
+        # A real seam crosses at least 30% of the image width.
         x_span = float(np.max(cx) - np.min(cx))
-        if x_span < w * 0.40:
+        if x_span < w * 0.30:
             return defects
 
         n = len(cx)
@@ -277,7 +331,8 @@ class SeamInspector:
                 "type": "Crooked Stitch",
                 "score": score,
                 "max_deviation_px": round(max_dev, 1),
-                "mse": round(mse, 2)
+                "mse": round(mse, 2),
+                "_raw_metrics": {"max_deviation_px": max_dev, "mse": mse},
             })
 
         return defects
@@ -291,7 +346,7 @@ class SeamInspector:
         defects: List[Dict[str, Any]] = []
 
         row_sums = np.sum(thread_mask, axis=1)
-        seam_rows = np.where(row_sums > w * 0.2)[0]
+        seam_rows = np.where(row_sums > w * 0.10)[0]
         if len(seam_rows) < 5:
             return defects
 
@@ -341,6 +396,7 @@ class SeamInspector:
                             "w": pucker_w, "h": seam_bottom - seam_top,
                             "type": "Pucker",
                             "score": min(99, int(z_score * 20)),
+                            "_raw_metrics": {"z_score": z_score, "region_width": pucker_w},
                         })
                     pucker_start_idx = None
 
@@ -354,6 +410,7 @@ class SeamInspector:
                     "w": pucker_w, "h": seam_bottom - seam_top,
                     "type": "Pucker",
                     "score": 60,
+                    "_raw_metrics": {"z_score": 2.0, "region_width": pucker_w},
                 })
 
         return defects
@@ -365,6 +422,7 @@ class SeamInspector:
         self,
         img_buffer: BinaryIO,
         settings: Optional[Dict[str, Any]] = None,
+        orientation: str = "horizontal",
     ) -> Tuple[np.ndarray, None, None, np.ndarray, List[Dict[str, Any]]]:
         if settings is None:
             settings = {}
@@ -373,6 +431,13 @@ class SeamInspector:
         self.gap_tolerance = settings.get("GAP_TOLERANCE", self.gap_tolerance)
 
         img_orig, img_small, img_gray, scale = self._preprocess(img_buffer)
+
+        # ── Handle vertical seams: rotate 90° CCW so all engines see a
+        #    horizontal seam, then rotate bboxes back afterward. ──
+        is_vertical = (orientation == "vertical")
+        if is_vertical:
+            img_gray = cv2.rotate(img_gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            img_small = cv2.rotate(img_small, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         # 1. Deskew
         rot_img, _ = self._deskew(img_gray)
@@ -385,6 +450,9 @@ class SeamInspector:
             thread_mask.shape[0] * thread_mask.shape[1], 1
         )
         if stitch_density < 0.015 or stitch_density > 0.35:
+            # Rotate back for viz
+            if is_vertical:
+                img_small = cv2.rotate(img_small, cv2.ROTATE_90_CLOCKWISE)
             return img_orig, None, None, img_small.copy(), []
 
         # 3. Run all three engines
@@ -403,9 +471,14 @@ class SeamInspector:
             "Pucker": (255, 255, 0),
         }
 
+        # ── Back-transform for vertical seams ──────────────────────────
+        # If we rotated 90° CCW earlier, rotate bboxes + viz image back.
+        rot_h, rot_w = img_small.shape[:2]  # dims of (possibly-rotated) image
+
         defect_log: List[Dict[str, Any]] = []
         for d in all_raw:
             color = type_colors.get(d["type"], (0, 0, 255))
+            # Draw on the (still rotated) output image
             cv2.rectangle(
                 output_img, (d["x"], d["y"]),
                 (d["x"] + d["w"], d["y"] + d["h"]), color, 2,
@@ -415,23 +488,52 @@ class SeamInspector:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
             )
 
-            confidence = min(99, max(10, d.get("score", 50)))
+            # Multi-metric severity scoring for seam defects
+            raw_metrics = d.get("_raw_metrics", {})
+            score_result = compute_seam_severity(d["type"], raw_metrics)
+            severity = score_result["Severity"]
+            score_details = score_result["Score_Details"]
+
+            # Compute bbox in original (un-rotated) coordinates
+            if is_vertical:
+                # 90° CCW was applied: to reverse, map (x,y,w,h) → rotated-back
+                orig_bx = d["y"]
+                orig_by = rot_w - d["x"] - d["w"]
+                orig_bw = d["h"]
+                orig_bh = d["w"]
+            else:
+                orig_bx, orig_by, orig_bw, orig_bh = d["x"], d["y"], d["w"], d["h"]
+
+            # Classify category
+            _cat_map = {
+                "Skip Stitch": "Structural",
+                "Broken Stitch": "Structural",
+                "Run-off Stitch": "Surface",
+                "Crooked Stitch": "Surface",
+                "Pucker": "Surface",
+            }
+
             entry: Dict[str, Any] = {
                 "ID": len(defect_log) + 1,
                 "Type": d["type"],
+                "Category": _cat_map.get(d["type"], "Surface"),
                 "Group": "Stitch Quality",
-                "Area (px)": int(d["w"] * d["h"] / (scale ** 2)),
-                "Confidence": f"{confidence}%",
-                "bbox_x": int(d["x"] / scale),
-                "bbox_y": int(d["y"] / scale),
-                "bbox_w": int(d["w"] / scale),
-                "bbox_h": int(d["h"] / scale),
+                "Area (px)": int(orig_bw * orig_bh / (scale ** 2)),
+                "Confidence": f"{severity}%",
+                "Severity": severity,
+                "Score_Details": score_details,
+                "bbox_x": int(orig_bx / scale),
+                "bbox_y": int(orig_by / scale),
+                "bbox_w": int(orig_bw / scale),
+                "bbox_h": int(orig_bh / scale),
             }
-            if "r_squared" in d:
-                entry["R²"] = d["r_squared"]
             if "max_deviation_px" in d:
                 entry["Max Deviation (px)"] = d["max_deviation_px"]
             defect_log.append(entry)
+
+        # Rotate viz image back for vertical seams
+        if is_vertical:
+            output_img = cv2.rotate(output_img, cv2.ROTATE_90_CLOCKWISE)
 
         return img_orig, None, None, output_img, defect_log
 
