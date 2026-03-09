@@ -172,26 +172,56 @@ class TextureInspector:
             peri = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.015 * peri, True)
             x, y, w, h = cv2.boundingRect(approx)
+            # Pad the tight contour box so it comfortably wraps the defect
+            _PAD = 10
+            _ih, _iw = img_gray.shape[:2]
+            x = max(0, x - _PAD)
+            y = max(0, y - _PAD)
+            w = min(_iw - x, w + 2 * _PAD)
+            h = min(_ih - y, h + 2 * _PAD)
             
             aspect_ratio = w / max(h, 1)
             hull = cv2.convexHull(contour)
             hull_area = max(cv2.contourArea(hull), 1)
             solidity = area / hull_area
 
-            # Scale back to original image
-            ox, oy = max(0, int(x / scale)), max(0, int(y / scale))
-            ow, oh = max(1, int(w / scale)), max(1, int(h / scale))
+            # Scale back to original image and clamp to bounds
+            orig_h, orig_w = img.shape[:2]
+            ox = max(0, int(x / scale))
+            oy = max(0, int(y / scale))
+            ow = max(1, min(int(w / scale), orig_w - ox))
+            oh = max(1, min(int(h / scale), orig_h - oy))
             real_area = max(1, int(area / (scale**2)))
 
-            # Intensity check to distinguish Hole (dark) vs Slub (bright/thick)
+            # ── Intensity + texture check to distinguish Hole / Oil Stain / Slub ──
             roi_gray = img_gray[y:y+h, x:x+w]
-            defect_gray_mean = np.mean(roi_gray) if roi_gray.size > 0 else 127
-            global_gray_mean = np.mean(img_gray)
-            
+            defect_gray_mean = float(np.mean(roi_gray)) if roi_gray.size > 0 else 127.0
+            global_gray_mean = max(1.0, float(np.mean(img_gray)))
+
+            # Neighbourhood for texture comparison
+            proc_h_t, proc_w_t = img_gray.shape[:2]
+            ex_t, ey_t = max(10, w // 2), max(10, h // 2)
+            ny1_t, nx1_t = max(0, y - ey_t), max(0, x - ex_t)
+            ny2_t, nx2_t = min(proc_h_t, y + h + ey_t), min(proc_w_t, x + w + ex_t)
+            neigh_t = img_gray[ny1_t:ny2_t, nx1_t:nx2_t]
+            neigh_mean = max(1.0, float(np.mean(neigh_t)))
+            darkness_ratio = defect_gray_mean / neigh_mean
+            inner_var = float(np.var(roi_gray.astype(np.float32))) if roi_gray.size > 0 else 0.0
+            neigh_var = max(1.0, float(np.var(neigh_t.astype(np.float32))))
+            texture_ratio = inner_var / neigh_var
+
             # Classification
             if aspect_ratio > 3.0 or aspect_ratio < 0.33:
                 d_type = "Tear"
                 color = (0, 0, 255)
+            elif darkness_ratio < 0.50 and texture_ratio < 0.35:
+                # Very dark + texture destroyed = structural hole
+                d_type = "Hole"
+                color = (255, 0, 0)
+            elif darkness_ratio < 0.85 and texture_ratio > 0.35 and solidity > 0.6:
+                # Moderately dark + texture preserved + compact = oil stain
+                d_type = "Oil Stain"
+                color = (0, 140, 255)
             elif defect_gray_mean < global_gray_mean * 0.80:
                 d_type = "Hole"
                 color = (255, 0, 0)

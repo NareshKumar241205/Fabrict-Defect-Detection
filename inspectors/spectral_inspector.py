@@ -114,6 +114,13 @@ class SpectralInspector:
             peri = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.015 * peri, True)
             x, y, w, h = cv2.boundingRect(approx)
+            # Pad the tight contour box so it comfortably wraps the defect
+            _PAD = 10
+            _ih, _iw = img_gray.shape[:2]
+            x = max(0, x - _PAD)
+            y = max(0, y - _PAD)
+            w = min(_iw - x, w + 2 * _PAD)
+            h = min(_ih - y, h + 2 * _PAD)
             
             aspect_ratio = w / max(h, 1)
             hull = cv2.convexHull(contour)
@@ -124,9 +131,12 @@ class SpectralInspector:
             if solidity < 0.15:
                 continue
 
-            # Scale back to original image
-            ox, oy = max(0, int(x / scale)), max(0, int(y / scale))
-            ow, oh = max(1, int(w / scale)), max(1, int(h / scale))
+            # Scale back to original image and clamp to bounds
+            orig_h, orig_w = img.shape[:2]
+            ox = max(0, int(x / scale))
+            oy = max(0, int(y / scale))
+            ow = max(1, min(int(w / scale), orig_w - ox))
+            oh = max(1, min(int(h / scale), orig_h - oy))
             real_area = max(1, int(area / (scale**2)))
 
             # Classification

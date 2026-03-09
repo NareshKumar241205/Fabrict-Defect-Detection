@@ -2,7 +2,7 @@
 FabricQA — Automated Fabric Defect Detection
 ==============================================
 Upload an image → Unified Processor routes to correct engines
-→ results categorized into Group I (Structure) and Group II (Stitch).
+→ results categorized into Structural and Surface defects.
 """
 
 import streamlit as st
@@ -17,30 +17,23 @@ from io import BytesIO
 from datetime import datetime
 from fpdf import FPDF
 
-from inspectors import texture_inspector, spectral_inspector, seam_inspector, edge_inspector
+from inspectors import texture_inspector, spectral_inspector, edge_inspector
 from inspectors.unified_processor import unified_processor
 
 # ──────────────────────────────────────────────
-# DEFECT CLASSIFICATION MAP (10-Type Taxonomy)
+# DEFECT CLASSIFICATION MAP (6-Type Taxonomy)
 # ──────────────────────────────────────────────
-# Group I: Fabric Structure defects (physical / pattern anomalies)
+# Fabric Structure defects (physical / pattern anomalies)
 GROUP_I_TYPES = {
     "Missing Thread", "Slub", "Oil Stain",
     "Hole", "Tear", "Snag",
 }
-# Group II: Stitch Quality defects (seam-related)
-GROUP_II_TYPES = {
-    "Skip Stitch", "Broken Stitch", "Run-off Stitch",
-    "Crooked Stitch", "Pucker",
-}
 # Structural = physically damaging (fabric integrity); Surface = visual/cosmetic
 STRUCTURAL_TYPES = {
     "Hole", "Tear", "Missing Thread",
-    "Skip Stitch", "Broken Stitch",
 }
 SURFACE_TYPES = {
     "Slub", "Snag", "Oil Stain",
-    "Run-off Stitch", "Crooked Stitch", "Pucker",
 }
 
 # Consistent color palette per defect type (BGR)
@@ -49,15 +42,10 @@ DEFECT_COLORS = {
     "Hole":           (60, 60, 255),
     "Tear":           (50, 50, 220),
     "Missing Thread": (80, 80, 240),
-    "Skip Stitch":    (70, 70, 230),
-    "Broken Stitch":  (90, 90, 250),
     # Surface (amber/yellow family)
     "Slub":           (30, 180, 255),
     "Snag":           (50, 160, 240),
     "Oil Stain":      (20, 140, 220),
-    "Run-off Stitch": (40, 170, 250),
-    "Crooked Stitch": (60, 190, 250),
-    "Pucker":         (10, 150, 230),
 }
 
 def classify_defect(defect_type: str) -> str:
@@ -68,7 +56,7 @@ def classify_defect(defect_type: str) -> str:
         return "Surface"
     # fallback heuristic
     low = defect_type.lower()
-    if any(k in low for k in ("tear", "hole", "break", "thread", "skip")):
+    if any(k in low for k in ("tear", "hole", "thread")):
         return "Structural"
     return "Surface"
 
@@ -112,6 +100,8 @@ st.markdown("""
     --structural-bg: rgba(248, 113, 113, 0.08);
     --surface-clr:   #fbbf24;
     --surface-bg:    rgba(251, 191, 36, 0.08);
+    --stitch-clr:    #34d399;
+    --stitch-bg:     rgba(52, 211, 153, 0.08);
     --gradient-2:    linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a78bfa 100%);
     --gradient-3:    linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
     --shadow:        0 4px 24px rgba(0, 0, 0, 0.4);
@@ -209,6 +199,11 @@ div[data-testid="stDecoration"] { display: none !important; }
     background: var(--surface-bg);
     border: 1px solid rgba(251,191,36,0.2);
     color: var(--surface-clr);
+}
+.cat-stitch {
+    background: var(--stitch-bg);
+    border: 1px solid rgba(52,211,153,0.2);
+    color: var(--stitch-clr);
 }
 
 /* ── Badges ── */
@@ -834,7 +829,7 @@ with tab_inspect:
                 with st.expander("🧠 Routing Details", expanded=False):
                     pre_info = routing_info.get("pre_classification", {})
                     st.markdown(f"""
-                    **Pre-classification:** Seam detected: `{pre_info.get('has_seam', False)}` · Fabric body: `{pre_info.get('has_fabric_body', True)}`  
+                    **Pre-classification:** Fabric body: `{pre_info.get('has_fabric_body', True)}`  
                     **Engines used:** {', '.join(routing_info.get('engines_used', []))}  
                     **Defect types found:** {', '.join(result['summary'].get('defect_types_found', [])) or 'None'}
                     """)
@@ -889,7 +884,6 @@ with tab_inspect:
                     "entropy": "🧵 Entropy Heatmap (Texture)",
                     "saliency": "📡 Saliency Map (Spectral+DWT)",
                     "anomaly_heatmap": "📐 Anomaly Heatmap (Edge+Frangi)",
-                    "seam_output": "🪡 Seam Detection Output",
                     "ssim_heatmap": "🖼️ SSIM Deviation Map (Reference)",
                     "reference_result": "🔍 Reference Compare Result",
                 }

@@ -254,11 +254,18 @@ class ReferenceInspector:
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
 
-            # Map to original coordinates
-            ox = int(x / scale)
-            oy = int(y / scale)
-            ow = max(1, int(w / scale))
-            oh = max(1, int(h / scale))
+            # Map to original coordinates and clamp to bounds
+            orig_h_img, orig_w_img = orig_test.shape[:2]
+            ox = max(0, int(x / scale))
+            oy = max(0, int(y / scale))
+            ow = max(1, min(int(w / scale), orig_w_img - ox))
+            oh = max(1, min(int(h / scale), orig_h_img - oy))
+            # Pad so the box wraps the SSIM-detected region comfortably
+            _PAD = 10
+            ox = max(0, ox - _PAD)
+            oy = max(0, oy - _PAD)
+            ow = min(orig_w_img - ox, ow + 2 * _PAD)
+            oh = min(orig_h_img - oy, oh + 2 * _PAD)
 
             # Shape metrics
             aspect_ratio = w / max(h, 1)
@@ -281,14 +288,49 @@ class ReferenceInspector:
             # Scale: 0-255 defect_map → 0-100 confidence
             confidence = min(99, max(10, int(mean_deviation * 100 / 255)))
 
-            # Classification heuristic based on shape
-            if solidity > 0.85 and 0.4 < aspect_ratio < 2.5:
+            # ── Oil Stain vs Hole discrimination ──
+            # Grayscale features: darkness ratio, texture preservation, boundary sharpness
+            ref_roi = aligned[y:y+h, x:x+w] if aligned is not None else None
+            inner_mean_r = float(np.mean(ref_roi)) if ref_roi is not None and ref_roi.size > 0 else 0.0
+            rh, rw = aligned.shape[:2] if aligned is not None else (1, 1)
+            ex_r, ey_r = max(10, w // 2), max(10, h // 2)
+            ny1_r, nx1_r = max(0, y - ey_r), max(0, x - ex_r)
+            ny2_r, nx2_r = min(rh, y + h + ey_r), min(rw, x + w + ex_r)
+            neigh_r = aligned[ny1_r:ny2_r, nx1_r:nx2_r] if aligned is not None else None
+            neigh_mean_r = max(1.0, float(np.mean(neigh_r))) if neigh_r is not None and neigh_r.size > 0 else 1.0
+            darkness_ratio_r = inner_mean_r / neigh_mean_r
+
+            inner_var_r = float(np.var(ref_roi.astype(np.float32))) if ref_roi is not None and ref_roi.size > 0 else 0.0
+            neigh_var_r = max(1.0, float(np.var(neigh_r.astype(np.float32)))) if neigh_r is not None and neigh_r.size > 0 else 1.0
+            texture_ratio_r = inner_var_r / neigh_var_r
+
+            boundary_gradient = 0.0
+            global_gradient = 1.0
+            if contours:
+                cnt = contours[0]
+                rim_mask = np.zeros(defect_map.shape, dtype=np.uint8)
+                cv2.drawContours(rim_mask, [cnt], -1, 255, thickness=3)
+                sx = cv2.Sobel(aligned, cv2.CV_64F, 1, 0, ksize=3)
+                sy = cv2.Sobel(aligned, cv2.CV_64F, 0, 1, ksize=3)
+                gmag = np.sqrt(sx**2 + sy**2)
+                rim_px = gmag[rim_mask > 0]
+                boundary_gradient = float(np.mean(rim_px)) if rim_px.size > 0 else 0.0
+                global_gradient = max(1.0, float(np.mean(gmag)))
+            has_torn_edges = boundary_gradient > global_gradient * 1.3
+
+            # Classification: darkness + texture + boundary + shape
+            if (solidity > 0.6 and 0.4 < aspect_ratio < 2.5
+                    and darkness_ratio_r > 0.50 and texture_ratio_r > 0.35
+                    and not has_torn_edges):
                 d_type = "Oil Stain"
                 color = (0, 140, 255)
             elif aspect_ratio > 3.0 or aspect_ratio < 0.33:
                 d_type = "Missing Thread"
                 color = (0, 0, 255)
-            elif solidity < 0.5 and real_area > 1000:
+            elif (darkness_ratio_r < 0.50 and texture_ratio_r < 0.35) or (solidity < 0.5 and real_area > 1000):
+                d_type = "Hole"
+                color = (255, 0, 0)
+            elif has_torn_edges and real_area > 1000:
                 d_type = "Hole"
                 color = (255, 0, 0)
             elif solidity < 0.5:

@@ -67,27 +67,27 @@ SCORE_WEIGHTS: Dict[str, Dict[str, float]] = {
 
     # ── Edge / background-subtraction defects ──
     "Hole": {
-        "darkness_depth":     0.25,
-        "max_pixel_dev_35":   0.15,
-        "local_contrast":     0.15,
+        "darkness_depth":     0.25,   # primary: holes are extremely dark
+        "max_pixel_dev_35":   0.10,
+        "local_contrast":     0.10,
         "edge_gradient":      0.10,
         "area_ratio":         0.10,
-        "compactness":        0.10,
-        "boundary_strength":  0.05,
-        "variance_ratio":     0.05,
+        "compactness":        0.05,
+        "boundary_strength":  0.15,   # torn layer at edges → strong boundary
+        "variance_ratio":     0.10,   # low variance = texture destroyed
         "ncc_peak_dev":       0.00,
         "saturation_shift":   0.05,
     },
     "Oil Stain": {
-        "saturation_shift":   0.30,
-        "local_contrast":     0.15,
+        "local_contrast":     0.20,   # primary: moderate darkening, not extreme
+        "variance_ratio":     0.20,   # primary: texture preserved inside stain
         "max_pixel_dev_35":   0.10,
         "area_ratio":         0.10,
         "compactness":        0.10,
         "edge_gradient":      0.05,
-        "boundary_strength":  0.05,
-        "variance_ratio":     0.05,
-        "darkness_depth":     0.05,
+        "boundary_strength":  0.02,   # smooth boundary, no torn edges
+        "darkness_depth":     0.10,   # moderate darkness (not deep)
+        "saturation_shift":   0.08,   # works when images have colour
         "ncc_peak_dev":       0.05,
     },
 

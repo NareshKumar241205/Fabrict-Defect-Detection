@@ -130,6 +130,13 @@ class EdgeInspector:
             peri = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.015 * peri, True)
             x, y, w, h = cv2.boundingRect(approx)
+            # Pad the tight contour box so it comfortably wraps the defect
+            _PAD = 10
+            _ih, _iw = img_gray.shape[:2]
+            x = max(0, x - _PAD)
+            y = max(0, y - _PAD)
+            w = min(_iw - x, w + 2 * _PAD)
+            h = min(_ih - y, h + 2 * _PAD)
             
             aspect_ratio = w / max(h, 1)
             hull = cv2.convexHull(contour)
@@ -140,17 +147,60 @@ class EdgeInspector:
             if solidity < 0.2:
                 continue
 
-            # Check HSV Saturation for Oil Stain
+            # ── Oil Stain vs Hole discrimination ──
+            # Three grayscale-compatible features:
+            #   1. Darkness ratio: holes are extremely dark, stains moderately dark
+            #   2. Texture preservation: stains keep weave texture, holes destroy it
+            #   3. Boundary sharpness: holes have torn edges, stains diffuse smoothly
+
+            roi_gray = img_gray[y:y+h, x:x+w]
+            inner_mean = float(np.mean(roi_gray)) if roi_gray.size > 0 else 0.0
+
+            # Neighbourhood mean (expanded bbox)
+            expand_x, expand_y = max(10, w // 2), max(10, h // 2)
+            ny1, nx1 = max(0, y - expand_y), max(0, x - expand_x)
+            ny2, nx2 = min(proc_h, y + h + expand_y), min(proc_w, x + w + expand_x)
+            neigh = img_gray[ny1:ny2, nx1:nx2]
+            neigh_mean = max(1.0, float(np.mean(neigh)))
+
+            darkness_ratio = inner_mean / neigh_mean  # <0.50 = very dark (hole), 0.50-0.85 = moderate (stain)
+
+            # Texture preservation: variance ratio inside vs neighbourhood
+            inner_var = float(np.var(roi_gray.astype(np.float32))) if roi_gray.size > 0 else 0.0
+            neigh_var = max(1.0, float(np.var(neigh.astype(np.float32))))
+            texture_ratio = inner_var / neigh_var  # low = texture destroyed (hole), higher = preserved (stain)
+
+            # Boundary edge gradient (torn edges)
+            contour_mask = np.zeros(img_gray.shape, dtype=np.uint8)
+            cv2.drawContours(contour_mask, [contour], -1, 255, thickness=5)
+            sobel_x = cv2.Sobel(img_gray, cv2.CV_64F, 1, 0, ksize=3)
+            sobel_y = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
+            grad_mag = np.sqrt(sobel_x**2 + sobel_y**2)
+            boundary_pixels = grad_mag[contour_mask > 0]
+            boundary_gradient = float(np.mean(boundary_pixels)) if boundary_pixels.size > 0 else 0.0
+            global_gradient = max(1.0, float(np.mean(grad_mag)))
+            has_torn_edges = boundary_gradient > global_gradient * 1.3
+
+            # HSV saturation (works when images have colour)
             roi_sat = img_hsv[y:y+h, x:x+w, 1]
-            global_sat_mean = np.mean(img_hsv[:,:,1])
-            local_sat_mean = np.mean(roi_sat) if roi_sat.size > 0 else global_sat_mean
-            
-            # An Oil Stain is a soft structural defect with high solidity and a color/saturation shift
-            is_stain = (solidity > 0.6) and (local_sat_mean > global_sat_mean * 1.2)
-            
-            # Scale back to original image
-            ox, oy = max(0, int(x / scale)), max(0, int(y / scale))
-            ow, oh = max(1, int(w / scale)), max(1, int(h / scale))
+            global_sat_mean = float(np.mean(img_hsv[:, :, 1]))
+            local_sat_mean = float(np.mean(roi_sat)) if roi_sat.size > 0 else global_sat_mean
+            has_sat_shift = (global_sat_mean > 2.0) and (local_sat_mean > global_sat_mean * 1.2)
+
+            # Oil Stain: moderately dark + texture preserved + smooth boundary + compact shape
+            is_stain = (
+                solidity > 0.6
+                and darkness_ratio > 0.50
+                and not has_torn_edges
+                and (has_sat_shift or texture_ratio > 0.35)
+            )
+
+            # Scale back to original image and clamp to bounds
+            orig_h, orig_w = img.shape[:2]
+            ox = max(0, int(x / scale))
+            oy = max(0, int(y / scale))
+            ow = max(1, min(int(w / scale), orig_w - ox))
+            oh = max(1, min(int(h / scale), orig_h - oy))
             real_area = max(1, int(area / (scale**2)))
 
             # Classification

@@ -9,7 +9,6 @@ Architecture:
 
 Groups:
     Group I  (Fabric Structure): Spectral + Texture + Edge engines
-    Group II (Stitch Quality):   Projection + Regression + Laplacian engines
 
 Output schema per defect:
     {ID, Group, Engine, Inspector, Type, Area, Confidence, Solidity, bbox_*}
@@ -25,7 +24,6 @@ from config import DEFECT_TYPES, UNIFIED_SETTINGS
 from inspectors.spectral_inspector import SpectralInspector
 from inspectors.edge_inspector import EdgeInspector
 from inspectors.texture_inspector import TextureInspector
-from inspectors.seam_inspector import SeamInspector
 from inspectors.reference_inspector import ReferenceInspector
 
 logger = logging.getLogger(__name__)
@@ -40,10 +38,8 @@ class UnifiedProcessor:
         self._spectral = SpectralInspector()
         self._edge = EdgeInspector()
         self._texture = TextureInspector()
-        self._seam = SeamInspector()
         self._reference = ReferenceInspector()
         self._cfg = UNIFIED_SETTINGS
-        self._seam_thresh = self._cfg.get("SEAM_DETECTION_THRESH", 0.3)
 
     # ──────────────────────────────────────────
     # Shadow / Illumination removal
@@ -191,7 +187,7 @@ class UnifiedProcessor:
                 return False
             proj_norm = (proj - p_min) / (p_max - p_min)
             grad = np.abs(np.gradient(proj_norm))
-            edge_thresh = max(0.12, self._seam_thresh)
+            edge_thresh = max(0.12, self._cfg.get("SEAM_DETECTION_THRESH", 0.3))
             strong = np.where(grad > edge_thresh)[0]
             if len(strong) >= 2:
                 for i in range(len(strong) - 1):
@@ -237,8 +233,14 @@ class UnifiedProcessor:
         bh = defect.get("bbox_h", 1)
         aspect = bw / max(bh, 1)
 
-        sol_min = self._cfg.get("OIL_STAIN_SOLIDITY_MIN", 0.85)
+        sol_min = self._cfg.get("OIL_STAIN_SOLIDITY_MIN", 0.80)
 
+        # Solidity + compact shape.  The engine-level classifier already
+        # uses darkness/texture/boundary checks; here we just honour its
+        # label if it already said "Oil Stain".
+        orig_type = defect.get("Type", "")
+        if orig_type == "Oil Stain":
+            return "Oil Stain"
         if solidity > sol_min and 0.4 < aspect < 2.5:
             return "Oil Stain"
 
@@ -316,7 +318,13 @@ class UnifiedProcessor:
         sorted_defs = sorted(defects, key=_conf, reverse=True)
         keep: List[Dict[str, Any]] = []
         for d in sorted_defs:
-            if not any(_iou(d, k) >= iou_thresh for k in keep):
+            # Never let a defect from one Group suppress a defect from another Group.
+            # e.g. a wide Stitch Quality bbox must not kill a Fabric Structure detection.
+            suppressed = any(
+                _iou(d, k) >= iou_thresh and d.get("Group") == k.get("Group")
+                for k in keep
+            )
+            if not suppressed:
                 keep.append(d)
         return keep
 
@@ -441,32 +449,6 @@ class UnifiedProcessor:
 
         return defects, viz_maps
 
-    def _route_group_ii(
-        self, img_buffer: BinaryIO, sensitivity: float,  # noqa: ARG002
-        seam_orientation: str = "horizontal",
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Group II — Stitch Quality (Seam Inspector)."""
-        defects: List[Dict[str, Any]] = []
-        viz_maps: Dict[str, Any] = {}
-
-        try:
-            img_buffer.seek(0)
-            buf = BytesIO(img_buffer.read())
-            img_buffer.seek(0)
-            _, _, _, seam_output, seam_defs = self._seam.detect_defects(
-                buf, orientation=seam_orientation,
-            )
-            viz_maps["seam_output"] = seam_output
-            for d in seam_defs:
-                d["Engine"] = f"Seam ({d.get('Type', 'Unknown')})"
-                d["Group"] = "Stitch Quality"
-                d["Inspector"] = "Seam"
-            defects.extend(seam_defs)
-        except Exception as e:
-            logger.warning("Seam engine failed: %s", e)
-
-        return defects, viz_maps
-
     # ──────────────────────────────────────────
     # Reference-Based Inspection (Golden Image + SSIM)
     # ──────────────────────────────────────────
@@ -515,10 +497,12 @@ class UnifiedProcessor:
         """Run the full Unified Pipeline.
 
         Args:
+            remove_shadows: Kept for API compatibility; illumination correction
+                is now applied selectively (Oil Stain only — always on;
+                Hole/structural detections always use the raw image).
             ref_buffer: Optional golden-image buffer for Reference Compare mode.
 
-        Returns dict with keys: defects, group_i_defects, group_ii_defects,
-        viz_maps, routing_info, summary.
+        Returns dict with keys: defects, viz_maps, routing_info, summary.
         """
         all_defects: List[Dict[str, Any]] = []
         all_viz_maps: Dict[str, Any] = {}
@@ -526,10 +510,19 @@ class UnifiedProcessor:
 
         img_buffer.seek(0)
         raw_bytes = img_buffer.read()
-        if remove_shadows:
-            raw_bytes = self._remove_shadows(raw_bytes)
+
+        # Illumination correction is applied selectively:
+        #   • Holes (and all structural defects) — OFF: shadow removal can
+        #     flatten hole-edge contrast and create border artifacts.
+        #   • Oil Stain — ON: normalising illumination makes dark stains
+        #     stand out against the corrected background.
+        # Strategy: always run engines on raw bytes (for Holes etc.),
+        # then also run on shadow-corrected bytes and keep only Oil Stain
+        # detections from that second pass.
+        corrected_bytes = self._remove_shadows(raw_bytes)
 
         pipeline_buffer = BytesIO(raw_bytes)
+        corrected_buffer = BytesIO(corrected_bytes)
 
         # ── Deskew for pre-classification ONLY ──
         # Deskew corrects horizontal projection for the seam detector gate,
@@ -548,27 +541,22 @@ class UnifiedProcessor:
         region_info = self._pre_classify(img_deskewed)
 
         # Group I (fabric structure) always runs.
-        # Group II (seam/stitch) only runs if the pre-classifier detected a seam.
-        # In "full" mode we still respect the seam gate — running on plain fabric
-        # causes the knit loop pattern to be misclassified as Crooked Stitch.
         run_group_i = mode in ("full", "structure_only") or region_info["has_fabric_body"]
-        run_group_ii = (mode == "seam_only") or region_info["has_seam"]
 
         if run_group_i:
             engines_used.append("Group I: Fabric Structure")
+
+            # Pass 1 — raw (no illumination correction): captures Holes, Tears, etc.
             g1_defects, g1_viz = self._route_group_i(pipeline_buffer, sensitivity)
-            all_defects.extend(g1_defects)
+            non_stain = [d for d in g1_defects if d.get("Type") != "Oil Stain"]
             all_viz_maps.update(g1_viz)
 
-        if run_group_ii:
-            engines_used.append("Group II: Stitch Quality")
-            orientation = region_info.get("seam_orientation", "horizontal")
-            g2_defects, g2_viz = self._route_group_ii(
-                pipeline_buffer, sensitivity,
-                seam_orientation=orientation or "horizontal",
-            )
-            all_defects.extend(g2_defects)
-            all_viz_maps.update(g2_viz)
+            # Pass 2 — illumination-corrected: Oil Stain-only results
+            g1_corrected, _ = self._route_group_i(corrected_buffer, sensitivity)
+            stain_only = [d for d in g1_corrected if d.get("Type") == "Oil Stain"]
+
+            all_defects.extend(non_stain)
+            all_defects.extend(stain_only)
 
         # Reference Compare (SSIM Golden Image) if reference provided
         if ref_buffer is not None:
@@ -578,6 +566,18 @@ class UnifiedProcessor:
             )
             all_defects.extend(ref_defects)
             all_viz_maps.update(ref_viz)
+
+        # ── Stage 0: Clamp all bboxes to image bounds ─────────────────────
+        # Ensures every bbox wraps properly within the original image so
+        # downstream NMS, area filters, and visualisation are correct.
+        img_h, img_w = img_pre_gray.shape[:2]
+        for d in all_defects:
+            bx = max(0, d.get("bbox_x", 0))
+            by = max(0, d.get("bbox_y", 0))
+            bw = max(1, min(d.get("bbox_w", 1), img_w - bx))
+            bh = max(1, min(d.get("bbox_h", 1), img_h - by))
+            d["bbox_x"], d["bbox_y"] = bx, by
+            d["bbox_w"], d["bbox_h"] = bw, bh
 
         # ── Stage 1: Tighter NMS (0.35 instead of 0.50) ─────────────────────
         # A lower IoU threshold means boxes that partially overlap (same defect
@@ -604,30 +604,14 @@ class UnifiedProcessor:
         # ── Stage 2b: Oversized bbox filter ──────────────────────────────────
         # Drop any bounding box that covers more than 20% of the image.
         # Real defects are localised; a box this large is a false positive.
-        # Seam defects (like Crooked Stitch) can span the full seam length
-        # so we use a higher threshold (50%) for stitch-quality defects.
-        # Crooked Stitch and Pucker naturally span the full seam width, so
-        # we use an aspect-ratio guard instead of pure area for them.
         img_h, img_w = img_pre_gray.shape[:2]
         img_area = max(img_h * img_w, 1)
         MAX_FABRIC_RATIO = self._cfg.get("MAX_BOX_AREA_RATIO", 0.22)
-        MAX_SEAM_RATIO = 0.50
-        # Line-like stitch defects are exempt from area filter; they're wide
-        # but narrow.  Use aspect ratio instead: reject only if BOTH area is
-        # huge AND the box is roughly square (not line-like).
-        LINE_STITCH_TYPES = {"Crooked Stitch", "Pucker", "Run-off Stitch"}
 
         def _box_ok(d: Dict[str, Any]) -> bool:
             bw = d.get("bbox_w", 0)
             bh = d.get("bbox_h", 0)
             ratio = (bw * bh) / img_area
-            if d.get("Type") in LINE_STITCH_TYPES:
-                # These span a seam line — wide & narrow is normal.
-                # Only reject if >70% of the image AND roughly square.
-                aspect = max(bw, bh) / max(min(bw, bh), 1)
-                return ratio < 0.70 or aspect > 3.0
-            if d.get("Group") == "Stitch Quality":
-                return ratio < MAX_SEAM_RATIO
             return ratio < MAX_FABRIC_RATIO
 
         all_defects = [d for d in all_defects if _box_ok(d)]
@@ -635,34 +619,24 @@ class UnifiedProcessor:
         # ── Stage 3: Photometric & Gradient Rule Engine (Task 2) ─────────────
         # Validate each surviving bbox against the raw grayscale.
         # Drop proposals that lack local contrast or sharp edge gradients.
-        # Seam (stitch quality) defects are exempt — they detect path /
-        # spacing anomalies, not intensity anomalies.
         all_defects = [
             d for d in all_defects
-            if d.get("Group") == "Stitch Quality"
-            or self._validate_defect_geometry(img_pre_gray, d)
+            if self._validate_defect_geometry(img_pre_gray, d)
         ]
 
         # Re-number IDs
         for i, d in enumerate(all_defects, 1):
             d["ID"] = i
 
-        group_i = [d for d in all_defects if d.get("Group") == "Fabric Structure"]
-        group_ii = [d for d in all_defects if d.get("Group") == "Stitch Quality"]
-
         total = len(all_defects)
         summary = {
             "total_defects": total,
-            "group_i_count": len(group_i),
-            "group_ii_count": len(group_ii),
             "verdict": "PASS" if total == 0 else "FAIL",
             "defect_types_found": sorted(set(d.get("Type", "Unknown") for d in all_defects)),
         }
 
         return {
             "defects": all_defects,
-            "group_i_defects": group_i,
-            "group_ii_defects": group_ii,
             "viz_maps": all_viz_maps,
             "routing_info": {
                 "pre_classification": region_info,
