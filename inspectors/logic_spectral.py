@@ -66,7 +66,7 @@ class LogicSpectralInspector:
         reconstructed = cv2.resize(reconstructed, (w, h))
         return cv2.normalize(reconstructed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    def detect_defects(self, img_buffer: BinaryIO, sensitivity: float = 2.0) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    def detect_defects(self, img_buffer: BinaryIO, sensitivity: float = 2.0) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
         original, img_small, img_gray, scale = self._preprocess(img_buffer)
         
         fft_scales = [512, 256, 128]
@@ -133,4 +133,14 @@ class LogicSpectralInspector:
                 "Category": "Structural" if d_type == "Skip/Miss Stitch" else "Surface"
             })
 
-        return self.defects, saliency_map
+        viz_maps = {
+            "logic_spectral_map": saliency_map,
+            "grayscale_clahe": img_gray,
+            "multi_scale_saliency_512": saliency_maps[0],
+            "multi_scale_saliency_256": saliency_maps[1],
+            "multi_scale_saliency_128": saliency_maps[2],
+        }
+        if LOGIC_SPECTRAL_SETTINGS["USE_DWT"]:
+            viz_maps["dwt_map"] = dwt_map
+
+        return self.defects, viz_maps

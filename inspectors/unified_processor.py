@@ -31,7 +31,7 @@ class UnifiedProcessor:
             classic_buf = self._clone_buffer(img_buffer)
             classic_defs, classic_viz = self.classic_edge.detect_defects(classic_buf, sensitivity=sensitivity, remove_shadows=remove_shadows)
             all_defects.extend(classic_defs)
-            viz_maps["classical_edge_map"] = classic_viz
+            viz_maps.update(classic_viz)
         except Exception as e:
             logger.warning("Pipeline 1 (Classic Edge) failed: %s", e)
 
@@ -42,7 +42,7 @@ class UnifiedProcessor:
             spectral_buf = self._clone_buffer(img_buffer)
             logic_spec_defs, logic_spec_viz = self.logic_spectral.detect_defects(spectral_buf, sensitivity=sensitivity)
             all_defects.extend(logic_spec_defs)
-            viz_maps["logic_spectral_map"] = logic_spec_viz
+            viz_maps.update(logic_spec_viz)
         except Exception as e:
             logger.warning("Pipeline 2 (Logic Spectral) failed: %s", e)
 
@@ -50,7 +50,7 @@ class UnifiedProcessor:
             seam_buf = self._clone_buffer(img_buffer)
             logic_seam_defs, logic_seam_viz = self.logic_seam.detect_defects(seam_buf)
             all_defects.extend(logic_seam_defs)
-            viz_maps["logic_seam_map"] = logic_seam_viz
+            viz_maps.update(logic_seam_viz)
         except Exception as e:
             logger.warning("Pipeline 2 (Logic Seam) failed: %s", e)
 

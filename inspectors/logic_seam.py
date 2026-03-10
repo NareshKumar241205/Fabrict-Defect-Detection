@@ -239,7 +239,7 @@ class LogicSeamInspector:
         entropy = -np.sum(hist * np.log2(hist))
         return entropy
 
-    def detect_defects(self, img_buffer: BinaryIO) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    def detect_defects(self, img_buffer: BinaryIO) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         img_orig, img_small, img_gray, scale = self._preprocess(img_buffer)
         rot_img, _ = self._deskew(img_gray)
         thread_mask, proj = self._extract_stitch_mask(rot_img)
@@ -265,4 +265,12 @@ class LogicSeamInspector:
                 "Category": "Structural"
             })
 
-        return defect_log, rot_img
+        viz_maps = {
+            "logic_seam_map": rot_img,
+            "grayscale_clahe": img_gray,
+            "projection_profile": proj,
+            "binary_thread_mask": thread_mask,
+            "deskewed_image": rot_img,
+        }
+
+        return defect_log, viz_maps

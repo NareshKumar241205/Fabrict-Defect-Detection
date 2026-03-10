@@ -564,10 +564,21 @@ with tab_inspect:
                 map_cols = st.columns(min(3, max(1, len(viz_maps))))
                 map_items = list(viz_maps.items())
                 map_labels = {
-                    "entropy": "🧵 Entropy Heatmap (Texture)",
-                    "saliency": "📡 Saliency Map (Spectral+DWT)",
-                    "anomaly_heatmap": "📐 Anomaly Heatmap (Edge+Frangi)",
-                    "seam_output": "🪡 Seam Detection Output",
+                    "classical_edge_map": "🔍 Statistical Background Subtraction (Sauvola)",
+                    "logic_spectral_map": "📡 Multi-Scale FFT Spectral Residual",
+                    "logic_seam_map": "🪡 Hough-Aligned Thread Projection",
+                    "dwt_map": "🧵 DWT (db4) Texture Decomposition",
+                    "grayscale_clahe": "🖼️ Grayscale + CLAHE Output",
+                    "shadow_removal_mask": "🌑 Shadow Removal Mask",
+                    "projection_profile": "📈 1D Projection Profile",
+                    "binary_thread_mask": "🧵 Binary Thread Mask",
+                    "deskewed_image": "🔄 Deskewed Image",
+                    "multi_scale_saliency_512": "📡 FFT Saliency (512)",
+                    "multi_scale_saliency_256": "📡 FFT Saliency (256)",
+                    "multi_scale_saliency_128": "📡 FFT Saliency (128)",
+                    "dwt_map": "🧵 DWT (db4) Texture Decomposition",
+                    "final_binary_mask": "🔲 Final Binary Mask",
+                    "adaptive_threshold_map": "⚖️ Adaptive Threshold Map",
                 }
                 for idx, (key, viz_img) in enumerate(map_items):
                     col_idx = idx % len(map_cols)
@@ -576,10 +587,18 @@ with tab_inspect:
                             label = map_labels.get(key, key.replace("_", " ").title())
                             st.caption(label)
                             if viz_img is not None:
-                                # Apply colormap if grayscale
-                                if len(viz_img.shape) == 2:
-                                    viz_img = cv2.applyColorMap(viz_img, cv2.COLORMAP_JET)
-                                st.image(viz_img, channels="BGR", width="stretch")
+                                if isinstance(viz_img, np.ndarray):
+                                    if len(viz_img.shape) == 2:
+                                        # Apply colormap if grayscale
+                                        viz_img = cv2.applyColorMap(viz_img, cv2.COLORMAP_JET)
+                                        st.image(viz_img, channels="BGR", width="stretch")
+                                    elif len(viz_img.shape) == 1:
+                                        # Plot 1D array as line chart
+                                        st.line_chart(viz_img)
+                                    else:
+                                        st.write(f"Unsupported array shape: {viz_img.shape}")
+                                else:
+                                    st.write(f"Unsupported viz type: {type(viz_img)}")
 
 
                 # ── DEFECT TABLES ──

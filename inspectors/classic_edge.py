@@ -42,7 +42,7 @@ class ClassicEdgeInspector:
         bg = cv2.GaussianBlur(img_gray, (151, 151), 0)
         return cv2.subtract(bg, img_blur)
 
-    def detect_defects(self, img_buffer: BinaryIO, sensitivity: float = 2.5, remove_shadows: bool = False) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    def detect_defects(self, img_buffer: BinaryIO, sensitivity: float = 2.5, remove_shadows: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
         img, img_small, img_gray, img_hsv, scale = self._preprocess(img_buffer, remove_shadows=remove_shadows)
         diff_map = self._compute_background_subtraction(img_gray)
         
@@ -145,4 +145,11 @@ class ClassicEdgeInspector:
                 "Category": "Surface" if d_type == "Oil Stain" else "Structural"
             })
 
-        return self.defects, diff_map
+        viz_maps = {
+            "classical_edge_map": diff_map,
+            "grayscale_clahe": img_gray,
+            "final_binary_mask": binary,
+            "adaptive_threshold_map": (effective_thresh / effective_thresh.max() * 255).astype(np.uint8) if effective_thresh.max() > 0 else np.zeros_like(binary),
+        }
+
+        return self.defects, viz_maps
