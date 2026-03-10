@@ -29,7 +29,7 @@ class UnifiedProcessor:
         # ==========================================
         try:
             classic_buf = self._clone_buffer(img_buffer)
-            classic_defs, classic_viz = self.classic_edge.detect_defects(classic_buf, sensitivity=sensitivity)
+            classic_defs, classic_viz = self.classic_edge.detect_defects(classic_buf, sensitivity=sensitivity, remove_shadows=remove_shadows)
             all_defects.extend(classic_defs)
             viz_maps["classical_edge_map"] = classic_viz
         except Exception as e:

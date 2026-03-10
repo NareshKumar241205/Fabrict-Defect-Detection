@@ -11,7 +11,7 @@ class ClassicEdgeInspector:
     def __init__(self):
         self.defects: List[Dict[str, Any]] = []
 
-    def _preprocess(self, img_buffer: BinaryIO) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    def _preprocess(self, img_buffer: BinaryIO, remove_shadows: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         if hasattr(img_buffer, "seek"):
             img_buffer.seek(0)
         file_bytes = np.asarray(bytearray(img_buffer.read()), dtype=np.uint8)
@@ -23,6 +23,13 @@ class ClassicEdgeInspector:
 
         img_small = cv2.resize(img, (CLASSIC_SETTINGS["IMAGE_RESIZE_WIDTH"], target_h))
         img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+        
+        if remove_shadows:
+            # Apply shadow removal using illumination correction
+            kernel_size = max(51, int(min(img_gray.shape) * 0.1)) | 1  # Large kernel for background estimation
+            bg = cv2.GaussianBlur(img_gray.astype(np.float32), (kernel_size, kernel_size), 0)
+            img_gray = np.clip((img_gray.astype(np.float32) / (bg + 1e-8)) * 128, 0, 255).astype(np.uint8)
+        
         img_hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
 
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -35,8 +42,8 @@ class ClassicEdgeInspector:
         bg = cv2.GaussianBlur(img_gray, (151, 151), 0)
         return cv2.subtract(bg, img_blur)
 
-    def detect_defects(self, img_buffer: BinaryIO, sensitivity: float = 2.5) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-        img, img_small, img_gray, img_hsv, scale = self._preprocess(img_buffer)
+    def detect_defects(self, img_buffer: BinaryIO, sensitivity: float = 2.5, remove_shadows: bool = False) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+        img, img_small, img_gray, img_hsv, scale = self._preprocess(img_buffer, remove_shadows=remove_shadows)
         diff_map = self._compute_background_subtraction(img_gray)
         
         mean_diff = float(np.mean(diff_map))
@@ -109,7 +116,12 @@ class ClassicEdgeInspector:
 
             is_stain = (solidity > 0.6 and darkness_ratio > 0.50 and not has_torn_edges and (has_sat_shift or texture_ratio > 0.35))
 
-            if is_stain:
+            # Pucker Check: High darkness but low texture variation indicates puckering/shadow, not stain
+            is_pucker = (darkness_ratio > 0.70 and texture_ratio < 0.25 and solidity > 0.8)
+
+            if is_pucker:
+                d_type = "Puckering"
+            elif is_stain:
                 d_type = "Oil Stain"
             elif aspect_ratio > CLASSIC_SETTINGS["TEAR_ASPECT_RATIO_MIN"] or aspect_ratio < (1.0 / CLASSIC_SETTINGS["TEAR_ASPECT_RATIO_MIN"]):
                 d_type = "Tear"
@@ -127,7 +139,7 @@ class ClassicEdgeInspector:
                 "Type": d_type,
                 "Area (px)": real_area,
                 "Solidity": f"{solidity:.2f}",
-                "Confidence": f"{int(min(99, 50 + (solidity * 40)))}%",
+                "Quality Score": f"{int(min(99, 50 + (solidity * 40)))}%",
                 "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh,
                 "Pipeline": "Classical",
                 "Category": "Surface" if d_type == "Oil Stain" else "Structural"

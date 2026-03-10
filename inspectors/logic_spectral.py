@@ -127,7 +127,7 @@ class LogicSpectralInspector:
                 "Type": d_type,
                 "Area (px)": real_area,
                 "Solidity": f"{solidity:.2f}",
-                "Confidence": f"{confidence}%",
+                "Quality Score": f"{confidence}%",
                 "bbox_x": ox, "bbox_y": oy, "bbox_w": ow, "bbox_h": oh,
                 "Pipeline": "Logic",
                 "Category": "Structural" if d_type == "Skip/Miss Stitch" else "Surface"

@@ -87,7 +87,7 @@ def deduplicate_defects(defects, iou_threshold=0.5):
     if not defects:
         return defects
     
-    # Sort by confidence (highest first) to keep better detections
+    # Sort by quality score (highest first) to keep better detections
     defects = sorted(defects, key=lambda d: _conf_val(d), reverse=True)
     
     kept = []
@@ -138,7 +138,7 @@ def calculate_iou(defect1, defect2):
     return inter_area / union_area
 
 def _conf_val(d):
-    c = d.get("Confidence", "0%")
+    c = d.get("Quality Score", "0%")
     try: return int(str(c).replace("%", "").strip())
     except: return 0
 
@@ -282,7 +282,7 @@ def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defec
             pdf.cell(0, 10, "Defect Details", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(3)
 
-            headers = ["#", "Category", "Type", "Area (px)", "Confidence"]
+            headers = ["#", "Category", "Type", "Area (px)", "Quality Score (%)"]
             col_w = [10, 30, 50, 25, 25]
             pdf.set_font("Helvetica", "B", 9)
             pdf.set_fill_color(240, 240, 240)
@@ -296,7 +296,7 @@ def generate_pdf_report(base_img, structural_overlay, surface_overlay, all_defec
                 pdf.cell(col_w[1], 6, d.get("Category", ""), border=1)
                 pdf.cell(col_w[2], 6, d.get("Type", "")[:30], border=1)
                 pdf.cell(col_w[3], 6, str(d.get("Area (px)", "")), border=1)
-                pdf.cell(col_w[4], 6, str(d.get("Confidence", "")), border=1)
+                pdf.cell(col_w[4], 6, str(d.get("Quality Score", "")), border=1)
                 pdf.ln()
 
         pdf_output = BytesIO()
@@ -371,7 +371,7 @@ def draw_category_overlay(base_img, defects, color_bgr, label_prefix):
 
         # Label tag above box
         lbl = d.get("Type", "Defect")
-        conf = d.get("Confidence", "")
+        conf = d.get("Quality Score", "")
         tag = f"{lbl} ({conf})" if conf else lbl
 
         font_scale = max(0.4, min(0.7, bw / 200))
@@ -421,16 +421,45 @@ with tab_inspect:
 
     with col_cfg:
         with st.container(border=True):
-            st.markdown("**⚙️ Settings**")
-            sensitivity = st.slider("Detection sensitivity", 1.0, 5.0, 2.5, 0.1,
-                                    help="Higher = more sensitive, may produce false positives",
-                                    key="sens_slider")
-            conf_threshold = st.slider("Confidence threshold (%)", 0, 80, 30, 5,
-                                       help="Defects below this confidence are filtered out",
-                                       key="conf_slider")
+            st.markdown("**⚙️ Detection Parameters**")
+            
+            # Detection Threshold Multiplier with info
+            with st.expander("ℹ️ Detection Threshold Multiplier", expanded=False):
+                st.markdown("""
+                **Mathematical Concept**: Controls the trade-off between False Positives (FP) and True Positives (TP).
+                
+                **Formula**: `threshold = mean_diff + (4.5 - multiplier × 0.6) × std_diff`
+                
+                - **Higher values** (4.0-5.0): More conservative, fewer false positives but may miss defects
+                - **Lower values** (1.0-2.0): More aggressive, catches more defects but increases false alarms
+                - **Default** (2.5): Balanced detection sensitivity
+                """)
+            
+            detection_threshold = st.slider("Detection Threshold Multiplier", 1.0, 5.0, 2.5, 0.1,
+                                          help="Controls false positive vs true positive trade-off",
+                                          key="sens_slider")
+            
+            # Quality Score Threshold with info
+            with st.expander("ℹ️ Quality Score Threshold", expanded=False):
+                st.markdown("""
+                **Mathematical Concept**: Minimum reliability score for defect acceptance.
+                
+                **Calculation**: Based on geometric properties like solidity and shape consistency.
+                
+                **Formula**: `score = 50 + (solidity × 40)` (Classic Edge) or custom metrics (Logic inspectors)
+                
+                - **Higher threshold** (60-80%): Only high-confidence defects shown
+                - **Lower threshold** (0-30%): All potential defects displayed
+                - **Default** (30%): Balanced quality filtering
+                """)
+            
+            quality_threshold = st.slider("Quality Score Threshold (%)", 0, 80, 30, 5,
+                                        help="Minimum reliability score for defect acceptance",
+                                        key="conf_slider")
+            
             remove_shadows_ui = st.checkbox("Remove Shadows (Illumination Correction)", value=False,
-                                            help="Enable this if uneven lighting is causing false positive defects",
-                                            key="shadow_toggle")
+                                          help="Enable this if uneven lighting is causing false positive defects",
+                                          key="shadow_toggle")
 
     # ── PROCESS ──
     if img_file is not None:
@@ -446,7 +475,7 @@ with tab_inspect:
                 buf = clone_buffer(img_file)
                 
                 progress.progress(0.2, text="🧠  Routing to detection engines…")
-                result = unified_processor.process(buf, sensitivity=sensitivity, mode="full", remove_shadows=remove_shadows_ui)
+                result = unified_processor.process(buf, sensitivity=detection_threshold, mode="full", remove_shadows=remove_shadows_ui)
                 
                 progress.progress(0.9, text="📊  Compiling results…")
                 all_defects = result["defects"]
@@ -459,13 +488,13 @@ with tab_inspect:
                 for d in all_defects:
                     d["Category"] = classify_defect(d.get("Type", ""))
 
-                # Parse confidence string "42%" → 42, filter below threshold
+                # Parse quality score string "42%" → 42, filter below threshold
                 def _conf_val(d):
-                    c = d.get("Confidence", "0%")
+                    c = d.get("Quality Score", "0%")
                     try: return int(str(c).replace("%", "").strip())
                     except: return 0
 
-                all_defects = [d for d in all_defects if _conf_val(d) >= conf_threshold]
+                all_defects = [d for d in all_defects if _conf_val(d) >= quality_threshold]
 
                 # Deduplicate overlapping boxes across inspectors
                 all_defects = deduplicate_defects(all_defects, iou_threshold=0.5)
@@ -563,7 +592,7 @@ with tab_inspect:
                     if structural:
                         st.markdown('<div class="cat-hdr cat-structural">🔴  Structural Defects — Physical Damage</div>', unsafe_allow_html=True)
                         df_s = pd.DataFrame(structural)
-                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
+                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Quality Score", "Location"]
                         cols_order = [c for c in preferred if c in df_s.columns] + [c for c in df_s.columns if c not in preferred and not c.startswith("bbox")]
                         with st.container(border=True):
                             st.dataframe(df_s[cols_order], width="stretch")
@@ -571,14 +600,14 @@ with tab_inspect:
                     if surface:
                         st.markdown('<div class="cat-hdr cat-surface">🟡  Surface Defects — Visual / Textural</div>', unsafe_allow_html=True)
                         df_f = pd.DataFrame(surface)
-                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
+                        preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Quality Score", "Location"]
                         cols_order = [c for c in preferred if c in df_f.columns] + [c for c in df_f.columns if c not in preferred and not c.startswith("bbox")]
                         with st.container(border=True):
                             st.dataframe(df_f[cols_order], width="stretch")
 
                     # Combined download
                     df_all = pd.DataFrame(all_defects)
-                    preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Confidence", "Location"]
+                    preferred = ["Category", "Group", "Engine", "Inspector", "Type", "Area (px)", "Solidity", "Quality Score", "Location"]
                     cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred and not c.startswith("bbox")]
                     csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
                     st.download_button("⬇  Download Full Report (CSV)", csv, "parallel_pipeline_fabricqa_report.csv", mime="text/csv")
@@ -597,14 +626,14 @@ with tab_inspect:
                     for i, d in enumerate(all_defects[:20]):
                         col_desc, col_btn = st.columns([4, 1])
                         with col_desc:
-                            st.text(f"{d.get('Type', 'Unknown')} | {d.get('Confidence', '')} | {d.get('Inspector', '')}")
+                            st.text(f"{d.get('Type', 'Unknown')} | {d.get('Quality Score', '')} | {d.get('Inspector', '')}")
                         with col_btn:
                             if st.button("❌ False Positive", key=f"fb_{i}"):
                                 save_feedback({
                                     "timestamp": datetime.now().isoformat(),
                                     "filename": getattr(img_file, 'name', 'unknown'),
                                     "defect_type": d.get("Type", ""),
-                                    "confidence": d.get("Confidence", ""),
+                                    "quality_score": d.get("Quality Score", ""),
                                     "inspector": d.get("Inspector", ""),
                                     "action": "false_positive"
                                 })
@@ -646,7 +675,7 @@ with tab_batch:
             accept_multiple_files=True,
             key="batch_upload",
         )
-        batch_sens = st.slider("Sensitivity", 1.0, 5.0, 2.5, 0.1, key="batch_sens")
+        batch_detection_threshold = st.slider("Detection Threshold Multiplier", 1.0, 5.0, 2.5, 0.1, key="batch_sens")
         batch_shadows = st.checkbox("Remove Shadows", value=False, key="batch_shadows")
 
     if batch_files:
@@ -666,7 +695,7 @@ with tab_batch:
             try:
                 # ── UNIFIED PROCESSOR (Batch) ──
                 buf = clone_buffer(bf)
-                result = unified_processor.process(buf, sensitivity=batch_sens, mode="full", remove_shadows=batch_shadows)
+                result = unified_processor.process(buf, sensitivity=batch_detection_threshold, mode="full", remove_shadows=batch_shadows)
                 defects = result["defects"]
 
                 for d in defects:
@@ -713,7 +742,7 @@ with tab_batch:
 
         if all_batch_defects:
             df_all = pd.DataFrame(all_batch_defects)
-            preferred = ["Filename", "Category", "Type", "Confidence"]
+            preferred = ["Filename", "Category", "Type", "Quality Score"]
             cols_order = [c for c in preferred if c in df_all.columns] + [c for c in df_all.columns if c not in preferred]
             csv = df_all[cols_order].to_csv(index=False).encode("utf-8")
             st.download_button("⬇  Download Batch Report", csv, "batch_report.csv", mime="text/csv")

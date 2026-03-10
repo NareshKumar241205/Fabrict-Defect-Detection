@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 from typing import Tuple, List, Dict, Any, BinaryIO, Optional
-from config import LOGIC_SEAM_SETTINGS
+from config import LOGIC_SEAM_SETTINGS, SEAM_SETTINGS
 
 class LogicSeamInspector:
     """PIPELINE 2: Detects Stitch Quality issues (Skip/Miss/Crooked Stitch)."""
@@ -148,6 +148,97 @@ class LogicSeamInspector:
 
         return defects
 
+    def _detect_puckering(self, proj: np.ndarray, rot_img: np.ndarray) -> List[Dict[str, Any]]:
+        """Detect puckering using periodicity analysis and entropy filtering."""
+        h, w = rot_img.shape[:2]
+        defects: List[Dict[str, Any]] = []
+
+        # Periodicity Analysis using 1D FFT
+        proj_norm = proj - np.mean(proj)
+        fft = np.fft.fft(proj_norm)
+        freqs = np.fft.fftfreq(len(proj))
+        
+        # Focus on positive frequencies, corresponding to spacing of 15-25 pixels
+        pos_freqs = freqs[:len(freqs)//2]
+        magnitudes = np.abs(fft[:len(fft)//2])
+        
+        # Find spacing in pixels (inverse of frequency)
+        spacings = 1.0 / pos_freqs[1:]  # Skip DC component
+        valid_spacings = spacings[(spacings >= 15) & (spacings <= 25)]
+        
+        if len(valid_spacings) > 0:
+            # Check if there's a significant peak at pucker frequency
+            peak_idx = np.argmax(magnitudes[1:]) + 1  # +1 because we skipped DC
+            peak_spacing = spacings[peak_idx - 1] if peak_idx < len(spacings) else 0
+            
+            if 15 <= peak_spacing <= 25 and magnitudes[peak_idx] > np.mean(magnitudes) * 2:
+                # Found periodic pattern, likely puckering
+                # Now check local entropy in regions of high projection variation
+                var_threshold = np.mean(proj) + SEAM_SETTINGS["PUCKER_VAR_SIGMA"] * np.std(proj)
+                high_var_regions = np.where(proj > var_threshold)[0]
+                
+                if len(high_var_regions) > 0:
+                    # Group consecutive high variance regions
+                    groups = []
+                    current_group = [high_var_regions[0]]
+                    
+                    for i in range(1, len(high_var_regions)):
+                        if high_var_regions[i] - high_var_regions[i-1] <= 5:  # Close proximity
+                            current_group.append(high_var_regions[i])
+                        else:
+                            groups.append(current_group)
+                            current_group = [high_var_regions[i]]
+                    groups.append(current_group)
+                    
+                    # Filter groups by minimum length (at least 3 peaks for periodicity)
+                    for group in groups:
+                        if len(group) >= 3:
+                            x_start, x_end = group[0], group[-1]
+                            y_start, y_end = 10, h - 10
+                            
+                            # Entropy check: compare ROI entropy to surrounding fabric
+                            roi = rot_img[y_start:y_end, x_start:x_end]
+                            if roi.size > 0:
+                                roi_entropy = self._calculate_entropy(roi)
+                                
+                                # Get surrounding fabric entropy (left and right of ROI)
+                                left_roi = rot_img[y_start:y_end, max(0, x_start-50):x_start]
+                                right_roi = rot_img[y_start:y_end, x_end:min(w, x_end+50)]
+                                
+                                surround_entropy = 0
+                                count = 0
+                                if left_roi.size > 0:
+                                    surround_entropy += self._calculate_entropy(left_roi)
+                                    count += 1
+                                if right_roi.size > 0:
+                                    surround_entropy += self._calculate_entropy(right_roi)
+                                    count += 1
+                                
+                                if count > 0:
+                                    surround_entropy /= count
+                                    
+                                    # If entropy is similar but intensity varies, it's puckering
+                                    entropy_ratio = roi_entropy / max(surround_entropy, 1e-8)
+                                    if 0.8 <= entropy_ratio <= 1.2:  # Similar entropy
+                                        score = min(99, int(len(group) * 10))
+                                        defects.append({
+                                            "x": x_start, "y": y_start,
+                                            "w": max(1, x_end - x_start), "h": y_end - y_start,
+                                            "type": "Seam Puckering", "score": score
+                                        })
+
+        return defects
+
+    def _calculate_entropy(self, img: np.ndarray) -> float:
+        """Calculate Shannon entropy of an image."""
+        if img.size == 0:
+            return 0.0
+        hist = cv2.calcHist([img], [0], None, [256], [0, 256])
+        hist = hist / hist.sum()
+        hist = hist[hist > 0]  # Avoid log(0)
+        entropy = -np.sum(hist * np.log2(hist))
+        return entropy
+
     def detect_defects(self, img_buffer: BinaryIO) -> Tuple[List[Dict[str, Any]], np.ndarray]:
         img_orig, img_small, img_gray, scale = self._preprocess(img_buffer)
         rot_img, _ = self._deskew(img_gray)
@@ -157,7 +248,7 @@ class LogicSeamInspector:
         if stitch_density < 0.015 or stitch_density > 0.35:
             return [], rot_img
 
-        all_raw = self._detect_projection_defects(proj, rot_img) + self._detect_crooked(thread_mask)
+        all_raw = self._detect_projection_defects(proj, rot_img) + self._detect_crooked(thread_mask) + self._detect_puckering(proj, rot_img)
 
         defect_log: List[Dict[str, Any]] = []
         for d in all_raw:
@@ -165,7 +256,7 @@ class LogicSeamInspector:
             defect_log.append({
                 "Type": d["type"],
                 "Area (px)": int(d["w"] * d["h"] / (scale ** 2)),
-                "Confidence": f"{confidence}%",
+                "Quality Score": f"{confidence}%",
                 "bbox_x": int(d["x"] / scale),
                 "bbox_y": int(d["y"] / scale),
                 "bbox_w": int(d["w"] / scale),
