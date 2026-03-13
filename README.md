@@ -20,7 +20,7 @@ It can identify and classify:
 * **Weave Irregularities** (Broken weave lines)
 
 ## Key Features
-* **6 Inspection Modes:** Full, Texture, Spectral, Seam, Edge/Structural, Reference Compare
+* **5 Inspection Modes:** Full, Texture, Spectral, Seam, Edge/Structural
 * **Batch Processing:** Upload multiple images and get a combined CSV report
 * **Inspection History:** Track quality trends over time with charts
 * **Gabor Filter Bank:** 18 directional filters to catch diagonal/oriented defects
@@ -106,8 +106,7 @@ pytest tests/ -v
 | 📡 **Spectral (FFT)** | Multi-resolution frequency saliency |
 | 🪡 **Seam / Stitch** | Skip-stitch and thread gap detection |
 | 📐 **Edge / Structure** | Wrinkle, fold, and weave irregularity detection |
-| 🖼️ **Reference Compare** | Golden image vs test sample diff |
-| 📦 **Batch Inspection** | Process multiple images with combined report |
+|  **Batch Inspection** | Process multiple images with combined report |
 | 📊 **History** | View past inspection results and defect trends |
 
 ## License
